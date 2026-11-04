@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import Carbon.HIToolbox
 import TatamiCore
 
 // Test isolation (used by tatami-e2e): TATAMI_PORT renames the CLI port, TATAMI_HOME holds config and state,
@@ -34,6 +35,10 @@ final class Daemon {
     private var quietUntil = Date.distantPast  // after a close, macOS picks its own next window: not a Follow
     private var lastHover = Date.distantPast
     private var lastMouseMove = Date.distantPast
+    /// When a hover asked macOS to focus each Window, until macOS confirms it.
+    private var hovered: [WindowID: Date] = [:]
+    /// When each dialog or panel opened: its app focusing it right then is part of opening, not focus from outside.
+    private var born: [WindowID: Date] = [:]
     private let borders = Borders()
     private lazy var statusBar = StatusBar { [unowned self] line in
         let result = execute(line)
@@ -67,6 +72,10 @@ final class Daemon {
         parkCorner = Daemon.corner()
         monitorRects = world.monitors.map(\.frame)
         registerHotkeys()
+        // Letters follow the keyboard layout, so switching layouts moves the hotkeys.
+        keep.append(DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name(kTISNotifySelectedKeyboardInputSourceChanged as String), object: nil, queue: .main
+        ) { [unowned self] _ in registerHotkeys() })
 
         let ws = NSWorkspace.shared.notificationCenter
         keep.append(ws.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [unowned self] n in
@@ -102,6 +111,9 @@ final class Daemon {
             reconcile()
         }
         keep.append(NSEvent.addGlobalMonitorForEvents(matching: .mouseMoved) { [unowned self] _ in hover() } as Any)
+        // A global monitor only sees events meant for other apps. With nothing focused (an empty Desk) tatami itself is
+        // the active app and gets the mouse events: without this, focus follows mouse was dead until a click.
+        keep.append(NSEvent.addLocalMonitorForEvents(matching: .mouseMoved) { [unowned self] e in hover(); return e } as Any)
         keep.append(NSEvent.addGlobalMonitorForEvents(matching: .leftMouseUp) { [unowned self] _ in
             // Let the last move/resize notification of the drag arrive first.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { self.settleDrags() }
@@ -209,6 +221,7 @@ final class Daemon {
             owner[id] = nil
             actual[id] = nil
             if osFocus == id { osFocus = nil }
+            quietUntil = Date() + 0.5  // an app quitting never jumps Desk either
             world.close(id)
         }
         reconcile()
@@ -232,7 +245,10 @@ final class Daemon {
             if desk == nil, case .desk(let n)? = rule { desk = n }
             // At first start each open Window joins the Active Desk of its Monitor.
             if desk == nil, initial { desk = world.activeDesk(on: monitor(at: frame)) }
-            world.open(id, floating: floating || rule == .float, desk: desk, focus: !initial)
+            // A dialog or panel gets focus from its app, or not at all: tatami follows, never decides. Forcing it took
+            // focus from a password field for its Caps Lock indicator, which then closed and reopened in a loop.
+            if floating { born[id] = Date() }
+            world.open(id, floating: floating || rule == .float, desk: desk, focus: !initial && !floating)
         case .closed(let id):
             // Also reached by Hide and minimize: remember the Desk so the Window rejoins it.
             rejoin[id] = world.desk(of: id)
@@ -240,28 +256,40 @@ final class Daemon {
             owner[id] = nil
             actual[id] = nil
             dragged.remove(id)
+            hovered[id] = nil
+            born[id] = nil
             if osFocus == id { osFocus = nil }
             quietUntil = Date() + 0.5
             world.close(id)
         case .focused(let id):
+            // macOS confirms a hover focus late, and across apps out of order: by then the mouse may be on another
+            // Window. That is no focus from outside, and following it would undo the newer hover.
+            // ponytail: 1 s window; number the requests if a real switch back within it ever gets lost.
+            if id == osFocus { hovered[id] = nil } else if Date().timeIntervalSince(hovered[id] ?? .distantPast) < 1 {
+                return debug("late confirmation of the hover on \(id) ignored")
+            }
             // Focus tatami did not ask for (app switcher, launcher shortcut, Dock): the cursor follows it,
             // like after a tatami focus command. After a click the cursor is already inside, so nothing moves.
             // Never while the mouse is in use: an app answering a hover by focusing another of its windows
             // would pull the cursor out of the user's hand.
-            warp = settled && id != osFocus
+            warp = settled && id != osFocus && Date().timeIntervalSince(born[id] ?? .distantPast) > 1
             if warp, Date().timeIntervalSince(lastMouseMove) < 0.7 {
                 warp = false
                 log("focus went to window \(id) of \(owner[id]?.app.localizedName ?? "?") while the mouse was on \(osFocus.map(String.init) ?? "nothing"); cursor left alone")
             }
+            // The app of the Window that had focus quit (the workspace may only say so later): macOS choosing again.
+            let quit = osFocus.flatMap { owner[$0]?.app.isTerminated } ?? false
             settled = true
             osFocus = id
             // Closing a Window never jumps Desk: right after a close, a Window on a hidden Desk getting focus
             // is macOS choosing, not the user. Skip it and let reconcile put focus back where tatami wants it.
-            if !(shown.hidden.contains(id) && Date() < quietUntil) { world.focus(window: id) }
+            if !(shown.hidden.contains(id) && (Date() < quietUntil || quit)) { world.focus(window: id) }
         case .changed(let id):
             if NSEvent.pressedMouseButtons & 1 != 0 { dragged.insert(id) }
         case .minimum(let id, let width, let height):
             world.setMinimumSize(id, width: width, height: height)
+        case .fixed(let id):
+            world.float(id)
         case .nativeFullscreen(let id, let on):
             world.setNativeFullscreen(id, on)
         case .title(let id, let title):
@@ -290,17 +318,28 @@ final class Daemon {
     private func hover() {
         lastMouseMove = Date()
         guard file.focusFollowsMouse, NSEvent.pressedMouseButtons == 0, let p = CGEvent(source: nil)?.location else { return }
-        // Cheap way out: still over the focused Tiled Window, and nothing can be floating above it.
-        if shown.floating.isEmpty, let f = shown.focused, shown.frames[f]?.contains(p.x, p.y) == true { return }
+        // Cheap way out: still over the focused Tiled Window, and nothing can be above it (no Floating Window, and
+        // not an Accordion, where the focused Window may sit behind another).
+        if shown.floating.isEmpty, world.layoutKind(ofDesk: world.focusedDesk) != .accordion,
+           let f = shown.focused, shown.frames[f]?.contains(p.x, p.y) == true { return }
         guard Date().timeIntervalSince(lastHover) > 0.03 else { return }
         lastHover = Date()
 
         // A window tatami does not manage counts as nothing being there.
-        if let id = windowUnder(p), let worker = owner[id] {
-            guard id != world.focusedWindow, !shown.hidden.contains(id) else { return }
+        let stack = windowsFrontToBack()
+        if var id = stack.first(where: { $0.bounds.contains(p) })?.id, owner[id] != nil {
+            // In an Accordion the Windows behind peek out from under the one on top. Hovering such an edge must not
+            // take focus from the Window you see: only a click brings another one forward. So the mouse anywhere
+            // on an Accordion counts as being on whichever of its Windows is on top.
+            if shown.frames[id] != nil, let desk = world.desk(of: id), world.layoutKind(ofDesk: desk) == .accordion {
+                let stacked = Set(world.windows(onDesk: desk)).intersection(shown.frames.keys)
+                id = stack.first { stacked.contains($0.id) }?.id ?? id
+            }
+            guard let worker = owner[id], id != world.focusedWindow, !shown.hidden.contains(id) else { return }
             let previous = osFocus.flatMap { old in owner[old].map { (pid: $0.app.processIdentifier, window: old) } }
             debug("hover focuses \(id), was \(String(describing: osFocus))")
             osFocus = id
+            hovered[id] = Date()
             world.focus(window: id)
             worker.focus(id, raise: false, previous: previous)
             reconcile()
@@ -312,15 +351,16 @@ final class Daemon {
         }
     }
 
-    /// The topmost normal window at a point, front to back.
-    private func windowUnder(_ p: CGPoint) -> WindowID? {
+    /// Windows on screen, front to back: normal ones and those above them up to the Dock (panels, system prompts).
+    /// A prompt is not a window tatami manages, but the mouse over it is not on the Window underneath either.
+    private func windowsFrontToBack() -> [(id: WindowID, bounds: CGRect)] {
         let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[CFString: Any]] ?? []
-        for w in list where w[kCGWindowLayer] as? Int == 0 {
-            if let bounds = w[kCGWindowBounds], let r = CGRect(dictionaryRepresentation: bounds as! CFDictionary), r.contains(p) {
-                return w[kCGWindowNumber] as? WindowID
-            }
+        return list.compactMap { w in
+            guard let layer = w[kCGWindowLayer] as? Int, (0..<Int(CGWindowLevelForKey(.dockWindow))).contains(layer),
+                  w[kCGWindowAlpha] as? Double ?? 1 > 0, let id = w[kCGWindowNumber] as? WindowID, let bounds = w[kCGWindowBounds],
+                  let r = CGRect(dictionaryRepresentation: bounds as! CFDictionary) else { return nil }
+            return (id, r)
         }
-        return nil
     }
 
     /// Mouse-up after dragging Tiled Windows: a resize moves the splits, a move swaps with the Window at the cursor.
@@ -372,7 +412,10 @@ final class Daemon {
             debug("reconcile focuses \(String(describing: layout.focused)), macOS had \(String(describing: osFocus))")
             osFocus = layout.focused
             if let f = layout.focused {
-                owner[f]?.focus(f, raise: true, previous: previous)
+                // Its raise may bury a Floating Window: put that right at once, not at the next check.
+                owner[f]?.focus(f, raise: true, previous: previous) { [unowned self] in
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { self.restack() }
+                }
             } else {
                 // Nothing focused: take the keyboard away from whatever Window macOS still has it on.
                 NSApp.activate(ignoringOtherApps: true)
@@ -385,6 +428,83 @@ final class Daemon {
             CGWarpMouseCursorPosition(CGPoint(x: m.x + m.w / 2, y: m.y + m.h / 2))
         }
         scheduleSave()
+        scheduleRestack()
+    }
+
+    // MARK: Accordion stacking
+
+    private var restacking: DispatchWorkItem?
+    private var lastRestack: (raised: [WindowID], order: [WindowID], at: Date) = ([], [], .distantPast)
+
+    /// Checked a moment after every change, once the raise that came with it has landed.
+    private func scheduleRestack() {
+        restacking?.cancel()
+        let work = DispatchWorkItem { [unowned self] in restack() }
+        restacking = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+    }
+
+    /// Two things macOS does not keep true by itself. Floating Windows stay above Tiled ones. And
+    /// in an Accordion every Window shows an edge only if, going outwards from the front one on either side, each
+    /// Window sits above the next. macOS brings one window forward at a time (a click, a focus), which can bury
+    /// the ones in between: bring those forward again, from the far ones to the front one.
+    private func restack() {
+        guard NSEvent.pressedMouseButtons == 0 else { return scheduleRestack() }  // not in the middle of a drag
+        let depth = Dictionary(windowsFrontToBack().enumerated().map { ($1.id, $0) }, uniquingKeysWith: { a, _ in a })
+        var raise: [WindowID] = [], order: [WindowID] = []
+        for m in world.monitors {
+            guard let desk = world.activeDesk(on: m.id) else { continue }
+            let members = world.windows(onDesk: desk).filter { depth[$0] != nil }
+            order += members.sorted { depth[$0]! < depth[$1]! }
+            let tiled = members.filter { shown.frames[$0] != nil }
+            guard !tiled.contains(where: shown.fullscreen.contains) else { continue }
+            var up: [WindowID] = []
+            let stack = tiled.sorted { (shown.frames[$0]!.x, shown.frames[$0]!.y) < (shown.frames[$1]!.x, shown.frames[$1]!.y) }
+            if world.layoutKind(ofDesk: desk) == .accordion, let f = stack.firstIndex(where: shown.front.contains) {
+                var buried: [WindowID] = []
+                // Each side from its far end towards the front: whatever is not below its nearer neighbours comes forward.
+                for side in [Array(stack[..<f]), Array(stack[(f + 1)...].reversed())] where !side.isEmpty {
+                    var inOrder = 1
+                    while inOrder < side.count, depth[side[inOrder]]! < depth[side[inOrder - 1]]! { inOrder += 1 }
+                    buried += side.dropFirst(inOrder)
+                }
+                let frontOnTop = stack.allSatisfy { $0 == stack[f] || depth[stack[f]]! < depth[$0]! }
+                if !buried.isEmpty || !frontOnTop { up = buried + [stack[f]] }
+            }
+            // Floating Windows are drawn over Tiled ones: one that a Tiled Window covers comes forward again
+            // (from the back, so they keep their own order).
+            let covered = members.filter(shown.floating.contains).sorted { depth[$0]! > depth[$1]! }.filter { f in
+                guard let r = actual[f] else { return false }
+                return tiled.contains { t in
+                    let o = shown.frames[t]!
+                    return (depth[t]! < depth[f]! || up.contains(t)) && o.x < r.maxX && r.x < o.maxX && o.y < r.maxY && r.y < o.maxY
+                }
+            }
+            raise += up + covered
+        }
+        guard !raise.isEmpty else { return }
+        // Each window is only asked to come forward: no app becomes the front one, the keyboard stays where it is,
+        // nothing blinks. Some apps ignore that (System Settings): their window then stays behind like any macOS
+        // window, until it is focused. Forcing it forward means making its app the front one, which took the
+        // keyboard away and blinked. Same windows in the same order as before the last try: it changed nothing.
+        if raise == lastRestack.raised, order == lastRestack.order, Date().timeIntervalSince(lastRestack.at) < 2 { return }
+        lastRestack = (raise, order, Date())
+        debug("restack raises \(raise)")
+        raiseInTurn(raise[...], all: raise)
+    }
+
+    private func raiseInTurn(_ ids: ArraySlice<WindowID>, all: [WindowID]) {
+        guard let id = ids.first else {
+            // Within one app, the window brought forward last also became its key window: the keyboard goes back
+            // to the focused Window, without raising it.
+            if let f = shown.focused, let from = all.last(where: { $0 != f && owner[$0] === owner[f] }) {
+                owner[f]?.focus(f, raise: false, previous: owner[from].map { (pid: $0.app.processIdentifier, window: from) })
+            }
+            updateBorders()
+            return scheduleRestack()  // did it work?
+        }
+        guard let worker = owner[id] else { return raiseInTurn(ids.dropFirst(), all: all) }
+        worker.raise(id) { [unowned self] in raiseInTurn(ids.dropFirst(), all: all) }
     }
 
     // MARK: State

@@ -6,6 +6,8 @@ private var onPress: ((Int) -> Void)?
 enum Hotkeys {
     private static var registered: [EventHotKeyRef] = []
     private static var installed = false
+    /// Letters and digits as the current keyboard layout places them; refreshed on every `register`.
+    private static var layout: [String: Int] = [:]
 
     /// "alt+shift+h" → key code and modifier mask. Nil if any part is unknown.
     static func parse(_ keys: String) -> (code: UInt32, modifiers: UInt32)? {
@@ -17,7 +19,7 @@ enum Hotkeys {
             case "ctrl", "control": modifiers |= controlKey
             case "cmd", "super": modifiers |= cmdKey
             default:
-                guard code == nil, let c = keyCodes[String(part)] else { return nil }
+                guard code == nil, let c = layout[String(part)] ?? keyCodes[String(part)] else { return nil }
                 code = c
             }
         }
@@ -37,6 +39,7 @@ enum Hotkeys {
             }, 1, &spec, nil, nil)
             installed = true
         }
+        layout = layoutCodes()
         registered.forEach { UnregisterEventHotKey($0) }
         registered = []
         onPress = press
@@ -54,8 +57,30 @@ enum Hotkeys {
         return refused
     }
 
-    // ponytail: key codes are physical ANSI positions, so on other keyboard layouts a bind follows
-    // the position, not the letter. Translate through the current layout (UCKeyTranslate) if that bites.
+    /// Which key types each letter and digit on the current layout, so "alt+z" is the key labelled Z on
+    /// AZERTY or Dvorak too. Punctuation stays physical: on many layouts it needs shift and would never fire.
+    /// A layout without a letter (Cyrillic) is swapped for its ASCII-capable pair; missing digits (AZERTY's
+    /// shifted top row) fall back to `keyCodes`.
+    private static func layoutCodes() -> [String: Int] {
+        guard let source = TISCopyCurrentASCIICapableKeyboardLayoutInputSource()?.takeRetainedValue(),
+              let ptr = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData) else { return [:] }
+        let data = Unmanaged<CFData>.fromOpaque(ptr).takeUnretainedValue() as Data
+        var map: [String: Int] = [:]
+        data.withUnsafeBytes { raw in
+            guard let layout = raw.bindMemory(to: UCKeyboardLayout.self).baseAddress else { return }
+            for code in 0..<65 {  // below the keypad, whose digits would shadow AZERTY's missing ones
+                var dead: UInt32 = 0, length = 0, chars = [UniChar](repeating: 0, count: 4)
+                guard UCKeyTranslate(layout, UInt16(code), UInt16(kUCKeyActionDown), 0, UInt32(LMGetKbdType()),
+                                     OptionBits(kUCKeyTranslateNoDeadKeysMask), &dead, 4, &length, &chars) == noErr,
+                      length == 1, let c = Character(UnicodeScalar(chars[0]) ?? " ").lowercased().first,
+                      c.isASCII, c.isLetter || c.isNumber, map[String(c)] == nil else { continue }
+                map[String(c)] = code
+            }
+        }
+        return map
+    }
+
+    /// Physical US positions: named keys, punctuation, and the fallback for anything the layout lacks.
     private static let keyCodes: [String: Int] = [
         "a": kVK_ANSI_A, "b": kVK_ANSI_B, "c": kVK_ANSI_C, "d": kVK_ANSI_D, "e": kVK_ANSI_E, "f": kVK_ANSI_F,
         "g": kVK_ANSI_G, "h": kVK_ANSI_H, "i": kVK_ANSI_I, "j": kVK_ANSI_J, "k": kVK_ANSI_K, "l": kVK_ANSI_L,

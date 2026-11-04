@@ -305,6 +305,27 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(w.layout.frames, [1: Rect(0, 0, 400, 600), 2: Rect(400, 0, 600, 300), 3: Rect(400, 300, 600, 300)])
     }
 
+    func testAccordionKeysAlongTheStackAreTiledAcrossItFloating() {
+        var w = world()  // a wide Monitor: the stack runs left to right
+        w.open(1); w.open(2); w.open(3)
+        w.apply(.layoutToggle)
+        w.open(8, floating: true); w.observed(8, at: Rect(300, 150, 400, 300))  // centred, over the stack
+        w.open(9, floating: true); w.observed(9, at: Rect(100, 100, 200, 200))
+        XCTAssertEqual(w.focusedWindow, 9)
+        w.apply(.focus(.left))  // along the stack from a Floating Window: back to the front Tiled one
+        XCTAssertEqual(w.focusedWindow, 3)
+        w.apply(.focus(.left)); XCTAssertEqual(w.focusedWindow, 2)  // never a Floating Window, wherever it sits
+        w.apply(.focus(.left)); XCTAssertEqual(w.focusedWindow, 1)
+        w.apply(.focus(.right)); XCTAssertEqual(w.focusedWindow, 2)
+        w.apply(.focus(.down))  // across the stack: the Floating Window used last
+        XCTAssertEqual(w.focusedWindow, 9)
+        w.apply(.focus(.up)); XCTAssertEqual(w.focusedWindow, 8)  // the other Floating Window
+        w.apply(.focus(.up)); XCTAssertEqual(w.focusedWindow, 2)  // past the last one: the Tiled Window again
+        w.apply(.focus(.up)); XCTAssertEqual(w.focusedWindow, 8)  // the one used last
+        w.apply(.focus(.down)); XCTAssertEqual(w.focusedWindow, 9)
+        w.apply(.focus(.down)); XCTAssertEqual(w.focusedWindow, 2)
+    }
+
     func testKeyboardFocusReachesFloatingWindows() {
         var w = world()
         w.open(1); w.open(2)

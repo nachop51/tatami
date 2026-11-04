@@ -53,8 +53,10 @@ public struct ConfigFile: Equatable, Sendable {
             lines += ["bind alt+\(key) = focus \(dir)", "bind alt+shift+\(key) = move \(dir)"]
         }
         for n in Command.deskNumbers {
-            lines += ["bind alt+\(n % 10) = desk \(n)", "bind alt+ctrl+\(n % 10) = send \(n)"]
+            lines += ["bind alt+\(n % 10) = desk \(n)", "bind alt+cmd+\(n % 10) = send \(n)"]
         }
+        // It resizes, but never wider than about 740 px: tiled, it would be found out and floated a moment later.
+        lines += ["", "rule com.apple.systempreferences = float"]
         return lines.joined(separator: "\n")
     }()
 

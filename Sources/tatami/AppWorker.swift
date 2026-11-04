@@ -14,6 +14,8 @@ enum WindowEvent {
     case changed(WindowID)
     /// The Window refused to shrink; 0 for a dimension it accepted.
     case minimum(WindowID, width: Double, height: Double)
+    /// The Window will not grow to its tile.
+    case fixed(WindowID)
     case nativeFullscreen(WindowID, Bool)
     /// Where the Window really is now (for its border).
     case frame(WindowID, Rect)
@@ -38,6 +40,7 @@ final class AppWorker {
     private var placed: [WindowID: Placement] = [:]  // what was applied successfully
     private var retryScheduled = false
     private var retries: [WindowID: Int] = [:]  // clamped-resize retries for the current target
+    private var refusals: [WindowID: Int] = [:]  // placements the app refused outright, for the current target
     private var sizes: [WindowID: CGSize] = [:]  // last size set, to skip the slow resize call on a Desk switch
     private var saved: [WindowID: CGPoint] = [:]  // position before parking
     private var native: Set<WindowID> = []  // in macOS native fullscreen
@@ -53,8 +56,10 @@ final class AppWorker {
     }
 
     /// Call before dropping the worker: the observer holds an unretained pointer to it.
+    /// Async: a hung app can hold its queue for seconds, and this is called from the main thread.
+    /// The block keeps the worker alive until the observer is gone.
     func invalidate() {
-        queue.sync {
+        queue.async { [self] in
             if let observer { CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .defaultMode) }
             observer = nil
         }
@@ -62,7 +67,7 @@ final class AppWorker {
 
     func place(_ id: WindowID, _ target: Placement) {
         queue.async { [self] in
-            if wanted[id] != target { retries[id] = nil }
+            if wanted[id] != target { retries[id] = nil; refusals[id] = nil }
             wanted[id] = target
             apply(id)
         }
@@ -71,7 +76,9 @@ final class AppWorker {
     private func apply(_ id: WindowID) {
         guard let w = windows[id], let target = wanted[id], placed[id] != target, !native.contains(id) else { return }
         let now = DispatchTime.now().uptimeNanoseconds
-        guard now >= hungUntil else { return retryLater() }
+        guard !hung else { return retryLater() }
+        let animated = calm()
+        defer { if animated { excite() } }
         var err = AXError.success
         switch target {
         case .frame(let r):
@@ -85,12 +92,27 @@ final class AppWorker {
                     setPosition(w, p)
                     // A window just moved to another Monitor has its resize clamped to the old one until the app
                     // catches up: try again shortly, twice at most (some windows really are smaller than asked).
-                    if let got = size(w), got.width < s.width - 1 || got.height < s.height - 1, retries[id, default: 0] < 2 {
-                        retries[id, default: 0] += 1
-                        queue.asyncAfter(deadline: .now() + 0.15) { [self] in
-                            guard wanted[id] == target else { return }
-                            placed[id] = nil; sizes[id] = nil
-                            apply(id)
+                    if let got = size(w), got.width < s.width - 1 || got.height < s.height - 1 {
+                        if retries[id, default: 0] < 2 {
+                            retries[id, default: 0] += 1
+                            queue.asyncAfter(deadline: .now() + 0.15) { [self] in
+                                guard wanted[id] == target else { return }
+                                placed[id] = nil; sizes[id] = nil
+                                apply(id)
+                            }
+                        } else {
+                            // Still smaller after the retries, and no longer changing: a window with a maximum size
+                            // (System Settings). It floats rather than leave its tile half empty.
+                            // ponytail: 100 px threshold, so a terminal snapping to whole character cells stays tiled.
+                            func tooSmall(_ z: CGSize?) -> Bool { z.map { $0.width < s.width - 100 || $0.height < s.height - 100 } ?? false }
+                            var last = size(w), still = 0
+                            for _ in 0..<20 where tooSmall(last) && still < 3 {
+                                usleep(50_000)
+                                let next = size(w)
+                                still = next == last ? still + 1 : 0
+                                last = next
+                            }
+                            if tooSmall(last) { send(.fixed(id)) }
                         }
                     }
                     // Apps resize late or animate: a size is a minimum only once it has stopped changing
@@ -129,6 +151,7 @@ final class AppWorker {
             }
         }
         if err == .success {
+            refusals[id] = nil
             placed[id] = target
             if target != .parked, let r = frame(w) { send(.frame(id, r)) }
         } else if err == .cannotComplete {
@@ -138,8 +161,29 @@ final class AppWorker {
             retryLater()
         } else {
             log("\(app.localizedName ?? "?"): could not place window \(id) (AXError \(err.rawValue))")
+            // While displays are being reconnected or wake up, apps refuse for a moment (seen: -25202 from cmux,
+            // Finder and Telegram). Without another try the window stayed wherever macOS had left it.
+            if refusals[id, default: 0] < 3 {
+                refusals[id, default: 0] += 1
+                retryLater()
+            }
         }
     }
+
+    /// Skipped for a while after a timeout, instead of paying the timeout on every call.
+    private var hung: Bool { DispatchTime.now().uptimeNanoseconds < hungUntil }
+
+    /// An app in "enhanced user interface" mode (an assistive tool or extension switched it on; seen with Zen)
+    /// animates every move it is asked to make: a Desk switch then slides its window in from the corner over
+    /// 200 ms. Off while tatami moves its windows, then back on. Returns whether it was on.
+    private func calm() -> Bool {
+        guard attribute(element, "AXEnhancedUserInterface") as? Bool == true else { return false }
+        // The result says nothing: Zen answers "not implemented" (-25208) and still obeys.
+        AXUIElementSetAttributeValue(element, "AXEnhancedUserInterface" as CFString, kCFBooleanFalse)
+        return true
+    }
+
+    private func excite() { AXUIElementSetAttributeValue(element, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue) }
 
     private func retryLater() {
         guard !retryScheduled else { return }
@@ -157,25 +201,34 @@ final class AppWorker {
 
     func frame(of id: WindowID, reply: @escaping (Rect?) -> Void) {
         queue.async { [self] in
-            let r = windows[id].flatMap(frame)
+            let r = hung ? nil : windows[id].flatMap(frame)
             DispatchQueue.main.async { reply(r) }
         }
     }
 
     /// `raise` false is focus-follows-mouse. `previous` is the Window that had focus.
-    func focus(_ id: WindowID, raise: Bool, previous: (pid: pid_t, window: WindowID)?) {
+    func focus(_ id: WindowID, raise: Bool, previous: (pid: pid_t, window: WindowID)?, then done: (() -> Void)? = nil) {
         queue.async { [self] in
-            guard let w = windows[id] else { return }
+            defer { if let done { DispatchQueue.main.async(execute: done) } }
+            guard !hung, let w = windows[id] else { return }
             focusWindow(pid: app.processIdentifier, window: id, previous: previous, raise: raise)
             // Raise once the app is frontmost: before that, it only reorders the window within its own app.
             if raise { AXUIElementPerformAction(w, kAXRaiseAction as CFString) }
         }
     }
 
+    /// Bring the Window forward without touching the keyboard or making its app the front one.
+    func raise(_ id: WindowID, then done: @escaping () -> Void) {
+        queue.async { [self] in
+            if let w = windows[id] { AXUIElementPerformAction(w, kAXRaiseAction as CFString) }
+            DispatchQueue.main.async(execute: done)
+        }
+    }
+
     /// Move the cursor to the Window's centre, unless it is already inside.
     func warp(_ id: WindowID) {
         queue.async { [self] in
-            guard let w = windows[id], let r = frame(w), let cursor = CGEvent(source: nil)?.location,
+            guard !hung, let w = windows[id], let r = frame(w), let cursor = CGEvent(source: nil)?.location,
                   !r.contains(cursor.x, cursor.y) else { return }
             CGWarpMouseCursorPosition(CGPoint(x: r.x + r.w / 2, y: r.y + r.h / 2))
         }
@@ -184,6 +237,8 @@ final class AppWorker {
     /// Bring parked Windows back on-screen (tatami is quitting).
     func restore(in group: DispatchGroup) {
         queue.async(group: group) { [self] in
+            let animated = calm()
+            defer { if animated { excite() } }
             for (id, p) in placed where p == .parked {
                 if let w = windows[id] { setPosition(w, saved[id] ?? CGPoint(x: 40, y: 40)) }
             }
@@ -193,6 +248,8 @@ final class AppWorker {
     /// The parking corner moved (Monitors changed).
     func repark() {
         queue.async { [self] in
+            let animated = calm()
+            defer { if animated { excite() } }
             for (id, p) in placed where p == .parked {
                 if let w = windows[id] { setPosition(w, parkCorner) }
             }
@@ -271,6 +328,7 @@ final class AppWorker {
         let visible = Set((CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[CFString: Any]] ?? [])
             .filter { $0[kCGWindowLayer] as? Int == 0 }.compactMap { $0[kCGWindowNumber] as? WindowID })
         let me = Unmanaged.passUnretained(self).toOpaque()
+        var floated = false
         for w in list {
             var id: CGWindowID = 0
             guard _AXUIElementGetWindow(w, &id) == .success, windows[id] == nil, visible.contains(id),
@@ -291,17 +349,26 @@ final class AppWorker {
             // Dialogs, panels, windows that cannot be resized, and anything a menu bar app shows, float.
             var resizable: DarwinBoolean = false
             AXUIElementIsAttributeSettable(w, kAXSizeAttribute as CFString, &resizable)
-            send(.opened(id, self, at: r, title: attribute(w, kAXTitleAttribute) as? String ?? "", floating: subrole != kAXStandardWindowSubrole || !resizable.boolValue || app.activationPolicy != .regular,
-                        initial: !scanned))
+            let floating = subrole != kAXStandardWindowSubrole || !resizable.boolValue || app.activationPolicy != .regular
+            floated = floated || floating
+            send(.opened(id, self, at: r, title: attribute(w, kAXTitleAttribute) as? String ?? "", floating: floating, initial: !scanned))
             if attribute(w, "AXFullScreen") as? Bool == true {
                 native.insert(id)
                 send(.nativeFullscreen(id, true))
             }
         }
+        // tatami does not give a dialog or panel focus: if the app already did, before the window was known, say so now.
+        if floated, scanned { reportFocus() }
         scanned = true
     }
 
     private func reportFocus() {
+        // A window that closes makes its app pick the next key window, and that news can arrive before the news
+        // of the close. The daemon must hear of the close first: it is how it tells macOS's choice from the user's.
+        for (id, w) in windows {
+            var v: CFTypeRef?
+            if AXUIElementCopyAttributeValue(w, kAXRoleAttribute as CFString, &v) == .invalidUIElement { forget(id) }
+        }
         guard app.isActive, let w = attribute(element, kAXFocusedWindowAttribute) else { return }
         var id: CGWindowID = 0
         if _AXUIElementGetWindow(w as! AXUIElement, &id) == .success, windows[id] != nil { send(.focused(id)) }

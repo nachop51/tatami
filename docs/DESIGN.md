@@ -1,6 +1,6 @@
 # tatami — design
 
-Status: planning agreed 2026-11-16. Phases 0–4 done: core in `Sources/TatamiCore` (`swift test`), shell in `Sources/tatami` (`swift build`, then `.build/debug/tatami start`). Next: phase 5, dogfood.
+Status: planning agreed 2026-11-16. Phases 0–4 done: core in `Sources/TatamiCore` (`swift test`), shell in `Sources/tatami` (`swift build`, then `.build/debug/tatami start`). Phase 5 (dogfood) in progress since 2026-11-13.
 Terms in **bold** are defined in [CONTEXT.md](../CONTEXT.md).
 
 ## Goal
@@ -88,8 +88,10 @@ Success is measured against the three AeroSpace problems that motivated it:
   keeps the running config and reports line and error.
 - With no file, built-in defaults apply.
 - One command vocabulary for CLI and binds. Binds can run shell commands via `exec`.
+- Bind keys: letters and digits follow the keyboard layout (`alt+z` is the key labelled Z on AZERTY
+  or Dvorak); punctuation and named keys are physical US positions. (Added 2026-11-19.)
 - No binding modes. A menu bar item shows each Monitor's Active Desk, left to right (`1 | 4`, focused one bold), with Reload and Stop in its menu. (Added 2026-11-16; the plan first said no menu bar item.)
-- Launched by hand with `tatami start`; `tatami stop` restores every Window.
+- Launched by hand with `tatami start`; `tatami stop` restores every Window. `./install.sh` puts a release build in `~/.local/bin` and starts it at login through a LaunchAgent (`dev.tatami`, no KeepAlive); it signs the build with a self-signed certificate named `tatami-dev` when the keychain has one, so the Accessibility grant follows the certificate and survives rebuilds (checked: two different builds started without a new grant); ad-hoc signed, every build needs the grant again.
 
 Sketch:
 
@@ -109,7 +111,7 @@ pin 1,3,5 = monitor 1
 bind alt+h       = focus left
 bind alt+shift+h = move left
 bind alt+1       = desk 1
-bind alt+ctrl+1  = send 1
+bind alt+cmd+1   = send 1
 bind alt+tab     = desk last
 bind alt+enter   = exec open -a Ghostty
 
@@ -192,7 +194,7 @@ Made while writing the core, where the decisions above were silent:
 - One private call: `_AXUIElementGetWindow`, to get a window id that survives a restart (state restore).
 - CLI talks to the running tatami over a `CFMessagePort`; hotkeys use Carbon `RegisterEventHotKey`.
 - Built-in binds with no config file: `alt+hjkl` focus, `alt+shift+hjkl` move, `alt+1…0` desk,
-  `alt+ctrl+1…0` send, `alt+tab` desk last, `alt+f` fullscreen, `alt+t` float, `alt+e` split, `alt+comma` layout.
+  `alt+cmd+1…0` send (was `alt+ctrl+1…0` until 2026-11-19), `alt+tab` desk last, `alt+f` fullscreen, `alt+t` float, `alt+e` split, `alt+comma` layout.
 - State file: `~/Library/Application Support/tatami/state.json`.
 - Live test, 8 windows on 2 Monitors: tiling, Desk switch (park and return), reload, bad command, stop
   from a hidden Desk, and restart after `kill -9` all behave. CLI round trip 11–13 ms.
@@ -269,15 +271,29 @@ Made while writing the core, where the decisions above were silent:
 - Checked: unit tests remap ids as a reboot would; e2e stops and restarts tatami and compares frames; on the
   real desktop a stop/start left `tatami state` and every window frame identical. A real reboot was not tried.
 
+## Dogfood fixes (2026-11-19)
+
+- Hotkeys follow the keyboard layout. At registration `UCKeyTranslate` maps key codes 0–64 (below the
+  keypad) on the current ASCII-capable layout to letters and digits; anything missing (AZERTY's shifted
+  digits) falls back to the physical US position. Punctuation stays physical: on many layouts it needs
+  shift and the bind would never fire. Switching layouts re-registers every bind.
+- Hung apps: a timed-out app now skips focus, warp and frame reads for 2 s too, not only placements.
+  Parking back on stop and re-parking after a Monitor change still try, so no Window is left off-screen.
+  Dropping the worker of a quit app no longer waits on its queue, which froze hotkeys behind a hung app.
+- Checked: build and unit tests; the layout map on US QWERTY equals the old table. Not tried: another
+  layout by real key press, a hung app against the full shell.
+
 ## Testing
 
 - `swift test`: the pure core, 37 unit tests, no macOS involved.
 - `swift build && swift run tatami-e2e`: end-to-end regression tests (`Sources/tatami-e2e`). A helper app opens
   test windows; an isolated tatami (own port, config and state through `TATAMI_PORT`, `TATAMI_HOME`,
   `TATAMI_ONLY_PID`) manages only that app; synthetic mouse events do the hovering and dragging; every
-  check reads the real window frames or the app's real key window. 60 checks, about 65 s: tiling and gaps,
-  keyboard focus and warp, focus follows mouse within one app, mouse resize from both sides, mouse swap,
-  Accordion (real `alt+comma` key press, focus brings a window to the front, reorder), Desk switch and Send, minimum size, float toggle, closing, stop.
+  check reads the real window frames or the app's real key window. 21 scenarios, 105 checks, about 3.5 minutes;
+  each scenario starts its own helper apps and tatami, so `swift run tatami-e2e dialogs follow` runs just those
+  (`--list` names them): tiling and gaps, keyboard focus and warp, focus follows mouse, mouse resize and swap,
+  Accordion (real `alt+comma` key press, hovering and clicking the edges), three-Window stack, Floating Windows above Tiled ones, a system prompt, a window with a maximum size, hovering from an empty Monitor, Desk switch and Send, minimum size, float toggle, closing, menu bar
+  app, two apps, a panel shown without focus, dialogs, Follow and its guard, an app quitting, stop and restart.
   Your own tatami must be stopped, and the mouse left alone while it runs: a moved mouse fails checks.
   `--no-mouse` skips hovering and dragging and turns focus-follows-mouse off in the test tatami, so the
   mouse can be used meanwhile (it still takes keyboard focus). It cannot run headless: macOS has one
@@ -290,11 +306,26 @@ Made while writing the core, where the decisions above were silent:
   a Window floated out of its tile kept the tile's size; hovering an unmanaged window blocked focusing
   an empty Monitor.
 - Found in use and fixed (2026-11-16): keyboard focus did not raise a window of another app (the raise ran before its app was frontmost), visible in Accordion. The e2e suite now runs a second helper app to cover focus across apps and an app quitting.
+- Found in use and fixed (2026-11-16): the cursor was pulled to a window's centre while sweeping the mouse across apps. macOS confirms a focus change late, and across apps out of order; a confirmation of an earlier hover was taken for focus from outside, so tatami warped the cursor there and re-focused. A confirmation for a Window the mouse has already left, within 1 s of that hover, is now ignored. The e2e helper apps confirm too fast to reproduce it: checked on the real desktop with `TATAMI_DEBUG=1` (18 mistaken events in a 10 s sweep before, 0 after).
+- Found in use and fixed (2026-11-16): with Caps Lock on, a System Settings password prompt lost focus several times a second. Its Caps Lock indicator is a small panel; tatami gave it focus like any new Window, the password field lost focus, the indicator closed, focus went back, and it opened again. tatami no longer gives focus to a new dialog or panel (anything auto-floated): the app does that, and tatami follows. New Tiled Windows still get focus. Covered by e2e (a panel shown without focus).
+- Found by new e2e scenarios and fixed (2026-11-16): closing a Window could jump Desk. When a window closes, its app picks the next key window, and macOS can report that focus before the close; the Follow guard only armed on hearing the close, so tatami followed to the other Desk. The worker now checks its Windows for closed ones before it reports a focus change, so the close always comes first. The same for an app that quits: macOS activates another app, whose window may be on a hidden Desk; that focus is not followed either.
+- Found in use and fixed (2026-11-16): in an Accordion, hovering the peeking edge of a Window behind gave it the keyboard while it stayed behind, and the Window on top only got focus back once the mouse had left the other one's whole frame (the hover shortcut "still inside the focused Window" does not hold when Windows overlap). Now the mouse anywhere on an Accordion counts as being on whichever of its Windows is on top on screen; only a click brings another one forward.
+- Found by e2e and fixed (2026-11-16): with focus on an empty Monitor, focus follows mouse was dead until a click. tatami is then the active app, and its global mouse monitor does not see events meant for its own app; a local monitor now covers that.
+- Found in use and fixed (2026-11-16), all about what sits above what. macOS brings one window forward at a time and keeps no order for tatami, so 150 ms after every change tatami compares the real order on screen with the one it needs and brings forward what is buried, far windows first:
+  - Accordion: going outwards from the front Window, each Window must sit above the next, or its edge does not show. With three Windows, clicking the first and then the last buried the middle one.
+  - Floating Windows stay above the Tiled ones of their Desk: a dialog used to end up behind the stack.
+- Found in use and fixed (2026-11-16): the mouse over a system prompt (not managed, and above normal windows) counted as being on the Window underneath, which took the keyboard from the prompt. Hover now looks at every window up to the Dock's level.
+- Found in use and fixed (2026-11-16): a window that resizes but has a maximum size (System Settings) left its tile half empty. A Window that stays more than 100 px short of its tile becomes a Floating Window. The threshold keeps terminals tiled, which snap to whole character cells.
+- Changed after use (2026-11-16): keyboard focus in an Accordion. Its Windows all cover the Monitor, so there is no geometry to go by: with a centred Floating Window, `focus right` went back and forth between it and one Tiled Window and never reached the rest of the stack. Now the two axes are told apart: along the stack is the Tiled Windows only, across it the Floating ones (the one used last, then the others, then back to the Tiled Window); from a Floating Window, along the stack goes to the front Tiled Window. Dwindle keeps judging by position.
+- Changed after use (2026-11-16): a buried window is only asked to come forward (no app becomes the front one, the keyboard stays put, nothing blinks). The first version made each window's app the front one in turn and handed the keyboard back: that blinked, and with System Settings it kept taking the keyboard. Some apps ignore the plain request (System Settings); their window then stays behind like any macOS window until it is focused (`focus up/down` in an Accordion). A check runs right after tatami's own raise.
+- A built-in Rule floats System Settings (`rule com.apple.systempreferences = float`), which never gets wider than about 740 px.
+- Found in use and fixed (2026-11-19): on a Desk switch the browser (Zen) slid in from the parking corner over 200 ms instead of just being there. tatami sent one move; the app animated it, because it was in "enhanced user interface" mode (`AXEnhancedUserInterface`, switched on by some assistive tool or extension), in which apps animate every move they are asked to make. tatami switches the mode off around its own moves and back on after. Measured with the window server's own bounds: 20 steps over 200 ms before, one step after, mode still on afterwards. Zen answers "not implemented" to the switch and obeys anyway.
+- Found in use and fixed (2026-11-19): after replugging the Monitors, windows stayed wherever macOS had left them. While displays reconnect or wake, apps refuse to be moved for a moment (`AXError -25202`, seen with cmux, Finder and Telegram); tatami logged it and did not try again. A refused placement is now retried after 2 s, three times at most. Not reproducible in e2e.
 - Menu bar ("accessory") apps: their windows are managed as Floating Windows (border, focus, hide with the Desk).
   Such an app is watched only once it shows a window (when it becomes active, or at start if it owns one).
   macOS does not announce these apps quitting, so every watched app's own termination is observed; before that
   a dead app's window stayed in its Desk and took keyboard focus.
-- Not covered by e2e: native fullscreen, Hide, dialogs, Monitor disconnect, hung apps, hotkeys, borders by eye,
+- Not covered by e2e: native fullscreen, Hide, Monitor disconnect, hung apps, Rules, borders by eye,
   multi-Monitor moves.
 
 ## Open risks
@@ -302,9 +333,9 @@ Made while writing the core, where the decisions above were silent:
 - Set size has a long tail (p95 81 ms, one 399 ms outlier; app not identified).
   Desk switches avoid it by only moving; the reconciler must not block other
   apps on a slow resize.
-- A hung app blocks its own worker for the full timeout on every call: set the
-  timeout globally via the system-wide element and skip an app after its first
-  timeout until it answers again.
+- Hung apps: handled. The timeout (0.5 s) is set on the system-wide element; after
+  a timeout the worker skips that app's calls for 2 s (parking it back on quit is
+  still attempted). Dropping a worker never waits on its queue.
 
 ## Working agreements
 

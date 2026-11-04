@@ -245,6 +245,16 @@ public struct World {
         }
     }
 
+    /// The Window will not grow to its tile: it floats, rather than leave part of the tile empty.
+    public mutating func float(_ w: WindowID) {
+        guard let n = desk(of: w), desks[n]!.live?.contains(w) == true else { return }
+        let history = desks[n]!.history
+        detach(w, from: n)
+        insert(w, into: n, floating: true)
+        desks[n]!.history = history
+        mins[w] = nil
+    }
+
     /// The Window entered or left macOS native fullscreen. Meanwhile tatami leaves it alone and keeps its tile.
     public mutating func setNativeFullscreen(_ w: WindowID, _ on: Bool) {
         if on { native.insert(w) } else { native.remove(w) }
@@ -332,7 +342,7 @@ public struct World {
             }
         case .move(let dir):
             guard let w = focusedWindow, let tree = desks[n]!.tree, tree.contains(w) else { return }
-            if let t = neighbour(of: w, dir, on: n) {
+            if let t = neighbour(of: w, dir, on: n), tree.contains(t) {
                 desks[n]!.tree = tree.swapping(w, t)
             } else if let m = neighbourMonitor(dir) {
                 transfer(w, from: n, to: active[m]!)
@@ -470,25 +480,30 @@ public struct World {
     /// The Window `focus <dir>` goes to from `w` on Desk `n`, or nil at the Desk's edge.
     /// Tiled Windows go to the Tiled Window next to them; a Floating Window in that direction wins if its
     /// centre is closer. From a Floating Window everything is judged by centres.
+    ///
+    /// An Accordion has no geometry to go by (its Windows all cover the Monitor), so its two axes are told apart:
+    /// along the stack is the Tiled Windows, across it the Floating ones.
     private func neighbour(of w: WindowID, _ dir: Direction, on n: Int) -> WindowID? {
         let d = desks[n]!
-        var frames = d.layout == .dwindle ? tiles(d) : [:]
-        if d.layout == .accordion, let tree = d.live { for leaf in tree.leaves { frames[leaf] = frame(d.monitor) } }
+        if d.layout == .accordion {
+            let area = frame(d.monitor)
+            let along: [Direction] = area.w >= area.h ? [.left, .right] : [.up, .down]
+            let step = [.left, .up].contains(dir) ? -1 : 1
+            if let leaves = d.live?.leaves, let i = leaves.firstIndex(of: w) {
+                if along.contains(dir) { return leaves.indices.contains(i + step) ? leaves[i + step] : nil }
+                return d.history.first(where: d.floating.contains)  // the Floating Window used last
+            }
+            // From a Floating Window: along the stack goes back to the front Tiled Window; across it, to the next
+            // Floating Window, and past the last one to the Tiled Window again.
+            guard !along.contains(dir), let i = d.floating.firstIndex(of: w), d.floating.indices.contains(i + step) else { return d.frontTiled }
+            return d.floating[i + step]
+        }
+        var frames = tiles(d)
         for f in d.floating { frames[f] = floatFrames[f] }
 
         var tiled: WindowID?
         if let tree = d.live, tree.contains(w) {
-            switch d.layout {
-            case .accordion:
-                let leaves = tree.leaves, i = leaves.firstIndex(of: w)!
-                let area = frame(d.monitor)
-                let along: [Direction] = area.w >= area.h ? [.left, .right] : [.up, .down]
-                if let step = along.firstIndex(of: dir).map({ $0 == 0 ? -1 : 1 }), leaves.indices.contains(i + step) {
-                    tiled = leaves[i + step]
-                }
-            case .dwindle:
-                tiled = nearest(from: frames[w]!, dir, d.history.filter { $0 != w && tree.contains($0) }.map { ($0, frames[$0]!) })
-            }
+            tiled = nearest(from: frames[w]!, dir, d.history.filter { $0 != w && tree.contains($0) }.map { ($0, frames[$0]!) })
         }
         // A Floating Window whose frame is not known yet cannot be judged: fall back to the front Tiled Window.
         guard let from = frames[w] else { return d.frontTiled }
@@ -512,7 +527,9 @@ public struct World {
             guard let r = frames[other], let score = distance(r) else { continue }
             if best == nil || score < best!.score { best = (other, score) }
         }
-        return best?.id
+        // From a Floating Window with nothing that way (it sits centred over the Tiled Windows): the front Tiled
+        // Window, so the keyboard can always leave a Floating Window.
+        return best?.id ?? (d.floating.contains(w) ? d.frontTiled : nil)
     }
 
     private func neighbourMonitor(_ dir: Direction) -> MonitorID? {
