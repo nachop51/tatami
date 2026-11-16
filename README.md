@@ -4,6 +4,10 @@ Quick and simple tiling window manager for macOS, with a Hyprland feel: windows 
 automatically (Dwindle or Accordion) and are grouped into Desks, without macOS Spaces.
 Draws its own borders. Swift, no dependencies, System Integrity Protection stays on.
 
+A personal tool, built for one setup and shared as is. It calls a few private (undocumented) macOS
+APIs for focus without raising, window ids and corner radii, all in `Sources/tatami/Private.swift`;
+a macOS update can break them. Developed on macOS 27.
+
 ## Run
 
 ```
@@ -32,3 +36,7 @@ swift run tatami-e2e       # a real tatami, real windows, synthetic mouse; see t
 ```
 
 Design, decisions and vocabulary: [docs/DESIGN.md](docs/DESIGN.md), [CONTEXT.md](CONTEXT.md).
+
+## License
+
+[MIT](LICENSE)
