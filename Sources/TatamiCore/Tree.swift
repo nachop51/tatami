@@ -15,10 +15,14 @@ public struct Rect: Equatable, Sendable {
 
 public enum Direction: String, Sendable { case left, right, up, down }
 
-enum Axis { case sideBySide, stacked }
+enum Axis: String, Codable { case sideBySide, stacked }
 
 /// The split tree of a Desk's Tiled Windows. In-order leaves double as the Accordion order.
-indirect enum Node: Equatable {
+/// Set on the ids of placeholders: Windows of a restored arrangement that have not shown up yet.
+/// They keep their place in the tree but take no room on screen.
+let ghostBit: WindowID = 0x8000_0000
+
+indirect enum Node: Equatable, Codable {
     case leaf(WindowID)
     case split(Axis, ratio: Double, Node, Node)
 
@@ -93,6 +97,11 @@ indirect enum Node: Equatable {
             }
         }
     }
+
+    /// The tree without the leaves that fail `keep`.
+    func keeping(_ keep: (WindowID) -> Bool) -> Node? { rewrite { keep($0) ? .leaf($0) : nil } }
+
+    func mapping(_ f: (WindowID) -> WindowID) -> Node { rewrite { .leaf(f($0)) }! }
 
     func inserting(_ new: WindowID, at target: WindowID, _ axis: Axis) -> Node {
         rewrite { $0 == target ? .split(axis, ratio: 0.5, .leaf(target), .leaf(new)) : .leaf($0) }!

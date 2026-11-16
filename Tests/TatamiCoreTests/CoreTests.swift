@@ -348,6 +348,68 @@ final class CoreTests: XCTestCase {
         XCTAssertEqual(w.layout.frames[2], Rect(500, 0, 500, 600))
     }
 
+    // MARK: Saving and restoring
+
+    func testRestoreBringsBackTheSameArrangement() throws {
+        var w = world([a, b])
+        w.open(1); w.open(2); w.open(3)  // Desk 1 on A
+        w.resized(3, from: Rect(500, 300, 500, 300), to: Rect(400, 200, 600, 400))
+        w.open(9, floating: true)
+        w.apply(.desk(4)); w.open(5); w.open(6)
+        w.apply(.layoutToggle)
+        w.apply(.desk(2)); w.open(7)  // Desk 2 on B
+        w.apply(.desk(4))
+        let before = w.layout
+        let saved = try JSONDecoder().decode(World.Snapshot.self, from: JSONEncoder().encode(w.snapshot))
+
+        // After a reboot the same Windows come back with new ids, in another order.
+        var r = World(monitors: [a, b], config: w.config, restoring: saved)
+        XCTAssertEqual(r.layout.frames, [:])
+        XCTAssertTrue(r.hasPlaceholders)
+        for (old, new) in [(7, 107), (3, 103), (6, 106), (1, 101), (9, 109), (5, 105), (2, 102)] as [(WindowID, WindowID)] {
+            XCTAssertTrue(r.adopt(old, as: new))
+        }
+        XCTAssertFalse(r.hasPlaceholders)
+        let after = r.layout
+        XCTAssertEqual(after.frames, Dictionary(uniqueKeysWithValues: before.frames.map { ($0.key + 100, $0.value) }))
+        XCTAssertEqual(after.hidden, Set(before.hidden.map { $0 + 100 }))
+        XCTAssertEqual(after.floating, Set(before.floating.map { $0 + 100 }))
+        XCTAssertEqual(after.focused, before.focused.map { $0 + 100 })
+        XCTAssertEqual(r.focusedDesk, 4)
+        XCTAssertEqual(r.layoutKind(ofDesk: 4), .accordion)
+        r.apply(.deskLast)
+        XCTAssertEqual(r.focusedDesk, 2)
+    }
+
+    func testPlaceholdersTakeNoRoomAndExpire() {
+        var w = world()
+        w.open(1); w.open(2); w.open(3)
+        var r = World(monitors: [a], config: w.config, restoring: w.snapshot)
+        XCTAssertTrue(r.adopt(1, as: 11))
+        XCTAssertEqual(r.layout.frames, [11: full])  // alone for now
+        XCTAssertTrue(r.adopt(3, as: 13))
+        XCTAssertEqual(r.layout.frames, [11: Rect(0, 0, 500, 600), 13: Rect(500, 0, 500, 600)])
+        XCTAssertFalse(r.adopt(8, as: 18))  // not part of the saved arrangement
+        r.open(20)  // a new Window meanwhile is fine
+        XCTAssertEqual(r.layout.frames.count, 3)
+        r.dropPlaceholders()  // 2 never came back
+        XCTAssertFalse(r.hasPlaceholders)
+        XCTAssertEqual(r.layout.frames.count, 3)
+        r.close(13); r.close(20)
+        XCTAssertEqual(r.layout.frames, [11: full])
+    }
+
+    func testDeskOfAwaitedWindowsSurvivesBeingEmpty() {
+        var w = world()
+        w.apply(.desk(3)); w.open(1)
+        w.apply(.desk(1))
+        var r = World(monitors: [a], config: w.config, restoring: w.snapshot)
+        XCTAssertEqual(r.deskNumbers, [1, 3])  // Desk 3 has no Window yet but one is awaited
+        XCTAssertTrue(r.adopt(1, as: 50))
+        XCTAssertEqual(r.layout.hidden, [50])
+        XCTAssertEqual(r.focusedDesk, 1)
+    }
+
     // MARK: Config file
 
     func testConfigFile() throws {
@@ -390,14 +452,14 @@ final class CoreTests: XCTestCase {
         let c = try ConfigFile.user("""
         gap.inner = 20
         bind shift+alt+h = desk 9
-        unbind alt+a
+        unbind alt+comma
         bind cmd+k = layout toggle
         layout 5, 7 = accordion
         """)
         XCTAssertEqual(c.layout.gapInner, 20)
         XCTAssertEqual(c.layout.gapOuter, 8)  // untouched default
         XCTAssertEqual(c.binds.filter { $0.keys.split(separator: "+").contains("h") }.map(\.command), [.focus(.left), .desk(9)])
-        XCTAssertFalse(c.binds.contains { $0.keys == "alt+a" })
+        XCTAssertFalse(c.binds.contains { $0.keys == "alt+comma" })
         XCTAssertTrue(c.binds.contains { $0.keys == "cmd+k" && $0.command == .layoutToggle })
         XCTAssertEqual(c.binds.count, ConfigFile.builtin.binds.count)  // one replaced, one removed, one added
         XCTAssertEqual(c.layouts, [5: .accordion, 7: .accordion])

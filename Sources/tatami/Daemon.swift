@@ -3,7 +3,7 @@ import ApplicationServices
 import TatamiCore
 
 // Test isolation (used by tatami-e2e): TATAMI_PORT renames the CLI port, TATAMI_HOME holds config and state,
-// TATAMI_ONLY_PID limits tatami to one app.
+// TATAMI_ONLY_PID limits tatami to the listed apps (comma separated).
 private let environment = ProcessInfo.processInfo.environment
 let portName = (environment["TATAMI_PORT"] ?? "dev.tatami.cli") as CFString
 private var daemon: Daemon!
@@ -14,21 +14,26 @@ final class Daemon {
     private static let configURL = testHome?.appendingPathComponent("config") ?? home.appendingPathComponent(".config/tatami/config")
     private static let stateURL = testHome?.appendingPathComponent("state.json")
         ?? home.appendingPathComponent("Library/Application Support/tatami/state.json")
-    private static let onlyPID = environment["TATAMI_ONLY_PID"].flatMap { pid_t($0) }
+    private static let onlyPIDs = environment["TATAMI_ONLY_PID"].map { Set($0.split(separator: ",").compactMap { pid_t($0) }) }
 
     private var file: ConfigFile
     private var world: World
     private var workers: [pid_t: AppWorker] = [:]
     private var owner: [WindowID: AppWorker] = [:]
     private var osFocus: WindowID?  // what macOS last told us, or what we last asked for
-    private var restored: [String: Int]  // Window→Desk mapping from the previous run
-    private var savedState: [String: Int] = [:]
+    private var rejoin: [WindowID: Int] = [:]  // Desk of Windows that left (Hide, minimize), for when they return
+    private var awaited: [SavedWindow]  // Windows of the saved arrangement that have not shown up yet
+    private var titles: [WindowID: String] = [:]
+    private var lastSaved = Data()
+    private var saveScheduled = false
     private var keep: [Any] = []
+    private var quits: [pid_t: NSKeyValueObservation] = [:]
     private var shown = Layout()  // what the last reconcile asked for
     private var dragged: Set<WindowID> = []  // Tiled Windows the mouse moved or resized, settled on mouse-up
     private var dragStart: [WindowID: Rect] = [:]  // where each Window was when the mouse went down on it
     private var quietUntil = Date.distantPast  // after a close, macOS picks its own next window: not a Follow
     private var lastHover = Date.distantPast
+    private var lastMouseMove = Date.distantPast
     private let borders = Borders()
     private lazy var statusBar = StatusBar { [unowned self] line in
         let result = execute(line)
@@ -41,8 +46,14 @@ final class Daemon {
         // Before reading any screen: without NSApplication, NSScreen misses the menu bar on secondary displays.
         _ = NSApplication.shared
         file = try Daemon.loadConfig()
-        world = World(monitors: Daemon.monitors(), config: Daemon.gaps(file), pins: file.pins, layouts: file.layouts)
-        restored = (try? JSONDecoder().decode([String: Int].self, from: Data(contentsOf: Daemon.stateURL))) ?? [:]
+        let saved = try? JSONDecoder().decode(SavedState.self, from: Data(contentsOf: Daemon.stateURL))
+        world = World(monitors: Daemon.monitors(), config: Daemon.gaps(file), pins: file.pins, layouts: file.layouts,
+                      restoring: saved?.world)
+        awaited = saved?.windows ?? []
+        // The state file used to be just Window id -> Desk: still honour one, so an upgrade keeps the Desks.
+        if saved == nil, let old = try? JSONDecoder().decode([String: Int].self, from: Data(contentsOf: Daemon.stateURL)) {
+            for (id, desk) in old { if let id = WindowID(id) { rejoin[id] = desk } }
+        }
     }
 
     func run() -> Never {
@@ -61,6 +72,9 @@ final class Daemon {
         keep.append(ws.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [unowned self] n in
             if let a = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication { add(a) }
         })
+        keep.append(ws.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { [unowned self] n in
+            if let a = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication { add(a, withWindow: true) }
+        })
         keep.append(ws.addObserver(forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { [unowned self] n in
             if let a = n.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication { remove(a) }
         })
@@ -71,12 +85,22 @@ final class Daemon {
             workers.values.forEach { $0.repark() }
             reconcile()
         })
+        // Whatever macOS has focused right now must not pull a hidden Desk of the saved arrangement into view.
+        quietUntil = Date() + 3
         // Until a Window reports focus, the focused Monitor is the one the cursor is on.
         if let p = CGEvent(source: nil)?.location, let m = world.monitors.first(where: { $0.frame.contains(p.x, p.y) }) {
             world.focus(monitor: m.id)
         }
-        NSWorkspace.shared.runningApplications.forEach(add)
+        let owners = Set((CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[CFString: Any]] ?? [])
+            .filter { $0[kCGWindowLayer] as? Int == 0 }.compactMap { $0[kCGWindowOwnerPID] as? pid_t })
+        for app in NSWorkspace.shared.runningApplications { add(app, withWindow: owners.contains(app.processIdentifier)) }
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [unowned self] in settled = true; reconcile() }
+        // Windows of the saved arrangement get this long to come back (apps reopening after login).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 120) { [unowned self] in
+            awaited = []
+            world.dropPlaceholders()
+            reconcile()
+        }
         keep.append(NSEvent.addGlobalMonitorForEvents(matching: .mouseMoved) { [unowned self] _ in hover() } as Any)
         keep.append(NSEvent.addGlobalMonitorForEvents(matching: .leftMouseUp) { [unowned self] _ in
             // Let the last move/resize notification of the drag arrive first.
@@ -145,6 +169,7 @@ final class Daemon {
 
     /// Every Window returns on-screen, then tatami exits.
     private func stop() -> Never {
+        writeState()
         let group = DispatchGroup()
         workers.values.forEach { $0.restore(in: group) }
         _ = group.wait(timeout: .now() + 2)
@@ -162,17 +187,28 @@ final class Daemon {
 
     // MARK: Events
 
-    private func add(_ app: NSRunningApplication) {
-        guard app.activationPolicy == .regular, workers[app.processIdentifier] == nil,
-              Daemon.onlyPID == nil || Daemon.onlyPID == app.processIdentifier else { return }
-        workers[app.processIdentifier] = AppWorker(app: app) { [unowned self] in handle($0) }
+    /// Regular apps are always watched. Menu bar ("accessory") apps number in the dozens and rarely have a
+    /// window, so one is watched only from the moment it shows one: when it becomes active, or at start if it
+    /// already owns a window (`withWindow`). Their Windows float.
+    private func add(_ app: NSRunningApplication, withWindow: Bool = false) {
+        let pid = app.processIdentifier
+        guard workers[pid] == nil, pid != getpid(), Daemon.onlyPIDs?.contains(pid) != false,
+              app.activationPolicy == .regular || (app.activationPolicy == .accessory && withWindow) else { return }
+        workers[pid] = AppWorker(app: app) { [unowned self] in handle($0) }
+        // NSWorkspace only announces regular apps quitting: watch the app itself so no window outlives it.
+        quits[pid] = app.observe(\.isTerminated) { [unowned self] app, _ in
+            DispatchQueue.main.async { if app.isTerminated { self.remove(app) } }
+        }
     }
 
     private func remove(_ app: NSRunningApplication) {
+        quits[app.processIdentifier] = nil
         guard let worker = workers.removeValue(forKey: app.processIdentifier) else { return }
         worker.invalidate()
         for (id, w) in owner where w === worker {
             owner[id] = nil
+            actual[id] = nil
+            if osFocus == id { osFocus = nil }
             world.close(id)
         }
         reconcile()
@@ -182,20 +218,25 @@ final class Daemon {
         if case .frame = event {} else { debug("event \(event) mouse=\(NSEvent.pressedMouseButtons)") }
         var warp = false
         switch event {
-        case .opened(let id, let worker, let frame, let floating, let initial):
+        case .opened(let id, let worker, let frame, let title, let floating, let initial):
             guard workers[worker.app.processIdentifier] === worker else { return }
+            owner[id] = worker
+            actual[id] = frame
+            titles[id] = title
+            world.observed(id, at: frame)
+            // Part of the arrangement saved last time? Then it goes back to exactly where it was.
+            if let saved = claim(app: Daemon.key(worker.app), title: title, id: id),
+               world.adopt(saved.id, as: id, floating: floating || saved.floating) { break }
             let rule = file.rules.first { $0.app == worker.app.localizedName || $0.app == worker.app.bundleIdentifier }?.action
-            var desk = restored.removeValue(forKey: String(id))
+            var desk = rejoin.removeValue(forKey: id)
             if desk == nil, case .desk(let n)? = rule { desk = n }
             // At first start each open Window joins the Active Desk of its Monitor.
             if desk == nil, initial { desk = world.activeDesk(on: monitor(at: frame)) }
-            owner[id] = worker
-            actual[id] = frame
-            world.observed(id, at: frame)
             world.open(id, floating: floating || rule == .float, desk: desk, focus: !initial)
         case .closed(let id):
             // Also reached by Hide and minimize: remember the Desk so the Window rejoins it.
-            restored[String(id)] = world.desk(of: id)
+            rejoin[id] = world.desk(of: id)
+            titles[id] = nil
             owner[id] = nil
             actual[id] = nil
             dragged.remove(id)
@@ -205,7 +246,13 @@ final class Daemon {
         case .focused(let id):
             // Focus tatami did not ask for (app switcher, launcher shortcut, Dock): the cursor follows it,
             // like after a tatami focus command. After a click the cursor is already inside, so nothing moves.
+            // Never while the mouse is in use: an app answering a hover by focusing another of its windows
+            // would pull the cursor out of the user's hand.
             warp = settled && id != osFocus
+            if warp, Date().timeIntervalSince(lastMouseMove) < 0.7 {
+                warp = false
+                log("focus went to window \(id) of \(owner[id]?.app.localizedName ?? "?") while the mouse was on \(osFocus.map(String.init) ?? "nothing"); cursor left alone")
+            }
             settled = true
             osFocus = id
             // Closing a Window never jumps Desk: right after a close, a Window on a hidden Desk getting focus
@@ -217,6 +264,9 @@ final class Daemon {
             world.setMinimumSize(id, width: width, height: height)
         case .nativeFullscreen(let id, let on):
             world.setNativeFullscreen(id, on)
+        case .title(let id, let title):
+            titles[id] = title
+            return scheduleSave()
         case .frame(let id, let frame):
             if NSEvent.pressedMouseButtons & 1 != 0, dragStart[id] == nil { dragStart[id] = actual[id] }
             actual[id] = frame
@@ -238,6 +288,7 @@ final class Daemon {
 
     /// Focus follows mouse, without raising.
     private func hover() {
+        lastMouseMove = Date()
         guard file.focusFollowsMouse, NSEvent.pressedMouseButtons == 0, let p = CGEvent(source: nil)?.location else { return }
         // Cheap way out: still over the focused Tiled Window, and nothing can be floating above it.
         if shown.floating.isEmpty, let f = shown.focused, shown.frames[f]?.contains(p.x, p.y) == true { return }
@@ -333,17 +384,58 @@ final class Daemon {
            let cursor = CGEvent(source: nil)?.location, !m.contains(cursor.x, cursor.y) {
             CGWarpMouseCursorPosition(CGPoint(x: m.x + m.w / 2, y: m.y + m.h / 2))
         }
-        saveState()
+        scheduleSave()
     }
 
-    private func saveState() {
-        var state: [String: Int] = [:]
-        for id in owner.keys { state[String(id)] = world.desk(of: id) }
-        guard state != savedState else { return }
-        savedState = state
+    // MARK: State
+
+    private struct SavedWindow: Codable {
+        var id: WindowID
+        var app: String  // bundle id, or name
+        var title: String
+        var floating: Bool
+    }
+
+    private struct SavedState: Codable {
+        var world: World.Snapshot
+        var windows: [SavedWindow]
+    }
+
+    private static func key(_ app: NSRunningApplication) -> String { app.bundleIdentifier ?? app.localizedName ?? "" }
+
+    /// The saved Window this one is: same id while the Mac stayed on; after a reboot ids are new,
+    /// so same app and title, else the app's next unclaimed Window.
+    private func claim(app: String, title: String, id: WindowID) -> SavedWindow? {
+        let i = awaited.firstIndex { $0.app == app && $0.id == id }
+            ?? awaited.firstIndex { $0.app == app && $0.title == title }
+            ?? awaited.firstIndex { $0.app == app }
+        return i.map { awaited.remove(at: $0) }
+    }
+
+    /// Saves a second from now at most, so a burst of changes is one write.
+    private func scheduleSave() {
+        guard !saveScheduled else { return }
+        saveScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [unowned self] in
+            saveScheduled = false
+            writeState()
+        }
+    }
+
+    private func writeState() {
+        // While Windows of the saved arrangement are still awaited, the file on disk knows more than we do.
+        guard !world.hasPlaceholders else { return }
+        let floating = world.layout.floating
+        let windows = owner.keys.sorted().compactMap { id in
+            owner[id].map { SavedWindow(id: id, app: Daemon.key($0.app), title: titles[id] ?? "", floating: floating.contains(id)) }
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        guard let data = try? encoder.encode(SavedState(world: world.snapshot, windows: windows)), data != lastSaved else { return }
+        lastSaved = data
         do {
             try FileManager.default.createDirectory(at: Daemon.stateURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try JSONEncoder().encode(state).write(to: Daemon.stateURL, options: .atomic)
+            try data.write(to: Daemon.stateURL, options: .atomic)
         } catch {
             log("could not save state: \(error.localizedDescription)")
         }

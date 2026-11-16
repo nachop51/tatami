@@ -21,7 +21,7 @@ import ApplicationServices
 if CommandLine.arguments.contains("--app") {
     setvbuf(stdout, nil, _IONBF, 0)
     let app = NSApplication.shared
-    app.setActivationPolicy(.regular)
+    app.setActivationPolicy(CommandLine.arguments.contains("--accessory") ? .accessory : .regular)
     var windows: [Int: NSWindow] = [:]
     DispatchQueue.global().async {
         // Commands on stdin: "open [minWidth minHeight]", "close <window number>".
@@ -92,20 +92,25 @@ var area = monitors[0]
 let parkX = NSScreen.screens.map(\.frame.maxX).max()! - 3
 let cursorAtStart = CGEvent(source: nil)!.location
 
-// Helper app.
-let helper = Process()
-let toHelper = Pipe(), fromHelper = Pipe()
-helper.executableURL = Bundle.main.executableURL
-helper.arguments = ["--app"]
-helper.standardInput = toHelper
-helper.standardOutput = fromHelper
-try! helper.run()
+// Helper apps: the main one, and a second so that some checks span two apps.
+func launchHelper(_ extra: [String] = []) -> (process: Process, input: Pipe, output: Pipe) {
+    let p = Process(), input = Pipe(), output = Pipe()
+    p.executableURL = Bundle.main.executableURL
+    p.arguments = ["--app"] + extra
+    p.standardInput = input
+    p.standardOutput = output
+    try! p.run()
+    return (p, input, output)
+}
+let (helper, toHelper, fromHelper) = launchHelper()
+let other = launchHelper()
+let menuBarApp = launchHelper(["--accessory"])
 
-func ask(_ command: String) -> String {
-    toHelper.fileHandleForWriting.write(Data((command + "\n").utf8))
+func ask(_ command: String, _ app: (process: Process, input: Pipe, output: Pipe)? = nil) -> String {
+    (app?.input ?? toHelper).fileHandleForWriting.write(Data((command + "\n").utf8))
     var line = ""
     while !line.hasSuffix("\n") {
-        let data = fromHelper.fileHandleForReading.availableData
+        let data = (app?.output ?? fromHelper).fileHandleForReading.availableData
         if data.isEmpty { break }
         line += String(data: data, encoding: .utf8) ?? ""
     }
@@ -121,20 +126,29 @@ func open(_ minimum: String = "") -> CGWindowID {
 var env = ProcessInfo.processInfo.environment
 env["TATAMI_PORT"] = "dev.tatami.e2e.\(getpid())"
 env["TATAMI_HOME"] = home.path
-env["TATAMI_ONLY_PID"] = String(helper.processIdentifier)
+env["TATAMI_ONLY_PID"] = "\(helper.processIdentifier),\(other.process.processIdentifier),\(menuBarApp.process.processIdentifier)"
 env["TATAMI_DEBUG"] = "1"
-let daemon = Process()
-daemon.executableURL = binary
-daemon.arguments = ["run"]
-daemon.environment = env
 let logURL = home.appendingPathComponent("log")
 FileManager.default.createFile(atPath: logURL.path, contents: nil)
-daemon.standardError = try! FileHandle(forWritingTo: logURL)
-try! daemon.run()
+func startTatami() -> Process {
+    let p = Process()
+    p.executableURL = binary
+    p.arguments = ["run"]
+    p.environment = env
+    let log = try! FileHandle(forWritingTo: logURL)
+    log.seekToEndOfFile()
+    p.standardError = log
+    try! p.run()
+    for _ in 0..<50 where CFMessagePortCreateRemote(nil, env["TATAMI_PORT"]! as CFString) == nil { usleep(100_000) }
+    return p
+}
+var daemon = startTatami()
 
 func cleanup() {
     if daemon.isRunning { daemon.terminate() }
     if helper.isRunning { helper.terminate() }
+    if other.process.isRunning { other.process.terminate() }
+    if menuBarApp.process.isRunning { menuBarApp.process.terminate() }
     CGWarpMouseCursorPosition(cursorAtStart)
 }
 signal(SIGINT) { _ in cleanup(); exit(1) }
@@ -160,7 +174,7 @@ guard CFMessagePortCreateRemote(nil, env["TATAMI_PORT"]! as CFString) != nil els
 
 // MARK: Observing
 
-let helperElement = AXUIElementCreateApplication(helper.processIdentifier)
+let helperElements = [helper, other.process, menuBarApp.process].map { AXUIElementCreateApplication($0.processIdentifier) }
 func attribute(_ e: AXUIElement, _ name: String) -> CFTypeRef? {
     var v: CFTypeRef?
     return AXUIElementCopyAttributeValue(e, name as CFString, &v) == .success ? v : nil
@@ -171,7 +185,7 @@ func windowID(_ e: AXUIElement) -> CGWindowID {
     return id
 }
 func frame(_ id: CGWindowID) -> CGRect {
-    for w in (attribute(helperElement, kAXWindowsAttribute) as? [AXUIElement]) ?? [] where windowID(w) == id {
+    for w in helperElements.flatMap({ (attribute($0, kAXWindowsAttribute) as? [AXUIElement]) ?? [] }) where windowID(w) == id {
         var p = CGPoint.zero, s = CGSize.zero
         if let pv = attribute(w, kAXPositionAttribute), let sv = attribute(w, kAXSizeAttribute) {
             AXValueGetValue(pv as! AXValue, .cgPoint, &p)
@@ -275,6 +289,16 @@ print("focus follows mouse")
 hover(CGPoint(x: frame(b).midX, y: frame(b).midY))
 check("hovering the right window focuses it (same app, no raise)", "focused \(focused())") { focused() == b }
 
+print("focus from outside while the mouse moves")
+let held = CGPoint(x: frame(a).midX + 50, y: frame(a).midY + 50)
+hover(held)
+mouse(.mouseMoved, CGPoint(x: held.x + 1, y: held.y))
+_ = ask("select \(b)")
+usleep(900_000)
+check("the cursor is left alone", "cursor \(CGEvent(source: nil)!.location), left at \(held)") {
+    abs(CGEvent(source: nil)!.location.x - held.x) < 3 && abs(CGEvent(source: nil)!.location.y - held.y) < 3
+}
+
 print("mouse resize")
 before = (frame(a), frame(b))
 drag(from: CGPoint(x: before.0.maxX - 1, y: before.0.midY), to: CGPoint(x: before.0.maxX + 149, y: before.0.midY))
@@ -303,14 +327,42 @@ check("a window dropped on itself snaps back", "a \(show(frame(a)))") { near(fra
 
 }
 
+func press(_ key: CGKeyCode, _ flags: CGEventFlags) {
+    for down in [true, false] {
+        let event = CGEvent(keyboardEventSource: nil, virtualKey: key, keyDown: down)!
+        event.flags = flags
+        event.post(tap: .cghidEventTap)
+        usleep(60_000)
+    }
+    usleep(400_000)
+}
+/// Front to back position among all on-screen windows.
+func depth(_ id: CGWindowID) -> Int {
+    let all = (CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[CFString: Any]] ?? []).compactMap { $0[kCGWindowNumber] as? CGWindowID }
+    return all.firstIndex(of: id) ?? .max
+}
+
 print("accordion")
-tatami("layout", "toggle")
-check("layout toggle stacks both windows nearly full-size, one peeking 32 px", "a \(show(frame(a))) b \(show(frame(b)))") {
+press(43 /* comma */, .maskAlternate)
+check("the alt+comma hotkey stacks both windows nearly full-size, one peeking 32 px", "a \(show(frame(a))) b \(show(frame(b)))") {
     near(frame(a).width, area.width - 2 * outer - 32) && near(frame(b).width, frame(a).width)
         && near(abs(frame(a).minX - frame(b).minX), 32) && near(min(frame(a).minX, frame(b).minX), area.minX + outer)
 }
-tatami("layout", "toggle")
-checkPair("toggling back restores the tiling", a, b)
+let (first, second) = frame(a).minX < frame(b).minX ? (a, b) : (b, a)
+tatami("focus", "left")
+check("focus left brings the first window to the front", "focused \(focused()) depths \(depth(first)) \(depth(second))") {
+    focused() == first && depth(first) < depth(second)
+}
+tatami("focus", "right")
+check("focus right brings the second one to the front", "focused \(focused()) depths \(depth(first)) \(depth(second))") {
+    focused() == second && depth(second) < depth(first)
+}
+tatami("move", "left")
+check("move left reorders the stack", "a \(show(frame(a))) b \(show(frame(b)))") {
+    frame(second).minX < frame(first).minX && focused() == second
+}
+press(43, .maskAlternate)
+checkPair("alt+comma again restores the tiling", a, b)
 tatami("desk", "6")
 check("a Desk with `layout N = accordion` starts as Accordion", tatami("state")) {
     tatami("state").split(separator: "\n").contains { $0.hasPrefix("desk 6 ") && $0.contains("accordion") }
@@ -362,13 +414,103 @@ check("after closing, focus stays on the Desk", "focused \(focused())") { [a, b]
 _ = ask("close \(b)")
 check("the last window fills the Monitor again", show(frame(a))) { near(frame(a).width, area.width - 2 * outer) }
 
-print("stop")
+print("menu bar app")
+before = (frame(a), frame(a))
+let settings = CGWindowID(ask("open", menuBarApp).split(separator: " ").last!)!
+usleep(1_500_000)
+check("a menu bar app's window is managed as a Floating Window", tatami("state")) {
+    tatami("state").components(separatedBy: "\n").contains { $0.components(separatedBy: "floating").last!.contains(String(settings)) && $0.contains("floating") }
+}
+check("and the tiling is left alone", show(frame(a))) { near(frame(a).width, before.0.width) }
+tatami("desk", "9")
+check("it hides with its Desk", show(frame(settings))) { frame(settings).minX >= parkX }
+tatami("desk", "last")
+check("and comes back", show(frame(settings))) { frame(settings).minX < parkX }
+menuBarApp.process.terminate()
+check("when it quits, its window is gone from the Desk", tatami("state")) { !tatami("state").contains(String(settings)) }
+
+print("two apps")
+let x = CGWindowID(ask("open", other).split(separator: " ").last!)!
+usleep(900_000)
+checkPair("a window of a second app tiles next to the first", a, x)
+if mouseTests {
+print("  mouse sweep across two apps")
+_ = ask("front"); _ = ask("front", other)
+// Sweep back and forth across both windows faster than macOS confirms each focus change.
+let ends = [CGPoint(x: frame(a).midX, y: frame(a).midY), CGPoint(x: frame(x).midX, y: frame(x).midY)]
+for i in 0..<9 {
+    mouse(.mouseMoved, ends[i % 2]); usleep(45_000)
+    mouse(.mouseMoved, CGPoint(x: ends[i % 2].x + 3, y: ends[i % 2].y)); usleep(45_000)
+}
+let rest = CGPoint(x: ends[0].x + 40, y: ends[0].y + 40)  // off-centre, so a warp to a centre shows
+mouse(.mouseMoved, rest)
+usleep(1_200_000)
+check("the cursor stays where the mouse left it", "cursor \(CGEvent(source: nil)!.location), left at \(rest)") {
+    let p = CGEvent(source: nil)!.location
+    return abs(p.x - rest.x) < 2 && abs(p.y - rest.y) < 2
+}
+check("and focus is on the window under it", "focused \(focused())") { focused() == a }
+hover(CGPoint(x: frame(x).midX, y: frame(x).midY))
+}
+tatami("layout", "toggle")
+let (lower, upper) = frame(a).minX < frame(x).minX ? (a, x) : (x, a)
+tatami("focus", "left")
+check("Accordion: focus left raises the other app's window", "depths \(depth(lower)) \(depth(upper))") { depth(lower) < depth(upper) }
+tatami("focus", "right")
+check("Accordion: focus right raises it back", "depths \(depth(lower)) \(depth(upper))") { depth(upper) < depth(lower) }
+tatami("focus", "left")
+check("and again the other way", "depths \(depth(lower)) \(depth(upper))") { depth(lower) < depth(upper) }
+tatami("layout", "toggle")
+let a2 = open()
+if mouseTests {
+    // Coming from another app onto a window that is not its app's key window.
+    _ = ask("front"); _ = ask("front", other)
+    hover(CGPoint(x: frame(a).midX, y: frame(a).midY))
+    check("hover: first app's window A is key", "focused \(focused())") { focused() == a }
+    hover(CGPoint(x: frame(x).midX, y: frame(x).midY))
+    check("hover: the other app takes focus", ask("key", other)) { ask("key", other) == "key \(x)" }
+    let target = CGPoint(x: frame(a2).midX + 30, y: frame(a2).midY + 30)
+    hover(target)
+    usleep(800_000)
+    check("hover back onto the first app's other window focuses that one, not A", "focused \(focused())") { focused() == a2 }
+    check("and the cursor is not pulled anywhere", "cursor \(CGEvent(source: nil)!.location), left at \(target)") {
+        let p = CGEvent(source: nil)!.location
+        return abs(p.x - target.x) < 2 && abs(p.y - target.y) < 2
+    }
+}
+other.process.terminate()
+check("when that app quits, the remaining windows fill the Monitor", "\(show(frame(a))) \(show(frame(a2)))") {
+    let f = [frame(a), frame(a2)]
+    return near(f[0].union(f[1]).width, area.width - 2 * outer) && near(f[0].union(f[1]).height, area.height - 2 * outer)
+        && !f[0].insetBy(dx: 2, dy: 2).intersects(f[1].insetBy(dx: 2, dy: 2))
+}
+
+print("stop and restart")
 let c = open()
+tatami("split", "toggle")
+tatami("float", "toggle")  // c floats; a and a2 stay tiled
+tatami("focus", "left")
+let arranged = [a, a2, c].map(frame)
+let stateBefore = tatami("state")
 tatami("desk", "7")
 check("windows parked before stop") { frame(a).minX >= parkX && frame(c).minX >= parkX }
+usleep(1_300_000)  // state is saved within a second of a change
 tatami("stop")
 check("tatami exits") { !daemon.isRunning }
 check("every window is back on-screen", "a \(show(frame(a))) c \(show(frame(c)))") { frame(a).minX < parkX && frame(c).minX < parkX }
+daemon = startTatami()
+check("after a restart the same Desk is active and the windows are hidden again", tatami("state")) {
+    frame(a).minX >= parkX && frame(a2).minX >= parkX && frame(c).minX >= parkX
+}
+tatami("desk", "last")
+check("their Desk comes back exactly as arranged", "\([a, a2, c].map { show(frame($0)) }) was \(arranged.map(show))") {
+    zip([a, a2, c].map(frame), arranged).allSatisfy { near($0.minX, $1.minX) && near($0.minY, $1.minY) && near($0.width, $1.width) && near($0.height, $1.height) }
+}
+check("tiled and floating as before", "\(tatami("state"))\nwas\n\(stateBefore)") {
+    tatami("state").components(separatedBy: "\n").first { $0.contains("floating [\(c)]") } != nil
+}
+tatami("stop")
+check("tatami exits again") { !daemon.isRunning }
 
 cleanup()
 let log = (try? String(contentsOf: logURL, encoding: .utf8)) ?? ""

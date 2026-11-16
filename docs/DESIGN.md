@@ -192,7 +192,7 @@ Made while writing the core, where the decisions above were silent:
 - One private call: `_AXUIElementGetWindow`, to get a window id that survives a restart (state restore).
 - CLI talks to the running tatami over a `CFMessagePort`; hotkeys use Carbon `RegisterEventHotKey`.
 - Built-in binds with no config file: `alt+hjkl` focus, `alt+shift+hjkl` move, `alt+1…0` desk,
-  `alt+ctrl+1…0` send, `alt+tab` desk last, `alt+f` fullscreen, `alt+t` float, `alt+e` split, `alt+a` layout.
+  `alt+ctrl+1…0` send, `alt+tab` desk last, `alt+f` fullscreen, `alt+t` float, `alt+e` split, `alt+comma` layout.
 - State file: `~/Library/Application Support/tatami/state.json`.
 - Live test, 8 windows on 2 Monitors: tiling, Desk switch (park and return), reload, bad command, stop
   from a hidden Desk, and restart after `kill -9` all behave. CLI round trip 11–13 ms.
@@ -219,7 +219,7 @@ Made while writing the core, where the decisions above were silent:
   under the cursor, or joins another Monitor's Active Desk when dropped on none (choice, not in the decisions above).
 - Startup does not take focus: Windows found at start join without focus until macOS reports the focused one.
 - A timed-out app (0.5 s) is skipped for 2 s, then its pending placements are retried.
-- Focus that tatami did not ask for (app switcher, launcher shortcut, Dock) also warps the cursor into the Window.
+- Focus that tatami did not ask for (app switcher, launcher shortcut, Dock) also warps the cursor into the Window. Not while the mouse is in use (moved within 0.7 s): an app that answers a hover by focusing another of its windows would otherwise pull the cursor away. When that happens it is logged with the app's name.
 - `tatami state` prints Desks, Tiled and Floating Windows and learnt minimums.
 - Live test, 8 windows on 2 Monitors: startup keeps focus; minimum sizes give a clean tiling with 2–3 of
   6 big-minimum windows floating on one Monitor; focus follows mouse without raise; keyboard focus and warp;
@@ -254,15 +254,30 @@ Made while writing the core, where the decisions above were silent:
   4 px border leaves 8 px of desktop visible between two borders (before, the borders filled the gap).
 - At start the focused Monitor is the one under the cursor.
 
+## Saved arrangement (2026-11-16)
+
+- `state.json` holds the whole arrangement: every Desk's split tree with ratios, Layout, Floating Windows,
+  focus order, each Monitor's Active Desk, the last Desk, and for every Window its id, app and title.
+  Written within a second of a change and on stop.
+- At start the Desks come back with a placeholder per Window. A placeholder takes no room; a Window that
+  shows up claims its own: by id while the Mac stayed on, and after a reboot (new ids) by app and title,
+  else the app's next unclaimed one. It then sits exactly where it was.
+- Windows get 120 s to come back (apps reopening after login); after that the remaining placeholders are
+  dropped and a late Window opens like any new one. Nothing is saved while placeholders are pending, so an
+  early stop cannot lose the saved arrangement.
+- Not restored: Fullscreen, learnt minimum sizes (relearnt), Floating Window positions (apps restore their own).
+- Checked: unit tests remap ids as a reboot would; e2e stops and restarts tatami and compares frames; on the
+  real desktop a stop/start left `tatami state` and every window frame identical. A real reboot was not tried.
+
 ## Testing
 
-- `swift test`: the pure core, 34 unit tests, no macOS involved.
+- `swift test`: the pure core, 37 unit tests, no macOS involved.
 - `swift build && swift run tatami-e2e`: end-to-end regression tests (`Sources/tatami-e2e`). A helper app opens
   test windows; an isolated tatami (own port, config and state through `TATAMI_PORT`, `TATAMI_HOME`,
   `TATAMI_ONLY_PID`) manages only that app; synthetic mouse events do the hovering and dragging; every
-  check reads the real window frames or the app's real key window. 34 checks, about 40 s: tiling and gaps,
+  check reads the real window frames or the app's real key window. 60 checks, about 65 s: tiling and gaps,
   keyboard focus and warp, focus follows mouse within one app, mouse resize from both sides, mouse swap,
-  Desk switch and Send, minimum size, float toggle, closing, stop.
+  Accordion (real `alt+comma` key press, focus brings a window to the front, reorder), Desk switch and Send, minimum size, float toggle, closing, stop.
   Your own tatami must be stopped, and the mouse left alone while it runs: a moved mouse fails checks.
   `--no-mouse` skips hovering and dragging and turns focus-follows-mouse off in the test tatami, so the
   mouse can be used meanwhile (it still takes keyboard focus). It cannot run headless: macOS has one
@@ -274,6 +289,11 @@ Made while writing the core, where the decisions above were silent:
   minimum size and floated for no reason; a new window moved to another Monitor kept a clamped size;
   a Window floated out of its tile kept the tile's size; hovering an unmanaged window blocked focusing
   an empty Monitor.
+- Found in use and fixed (2026-11-16): keyboard focus did not raise a window of another app (the raise ran before its app was frontmost), visible in Accordion. The e2e suite now runs a second helper app to cover focus across apps and an app quitting.
+- Menu bar ("accessory") apps: their windows are managed as Floating Windows (border, focus, hide with the Desk).
+  Such an app is watched only once it shows a window (when it becomes active, or at start if it owns one).
+  macOS does not announce these apps quitting, so every watched app's own termination is observed; before that
+  a dead app's window stayed in its Desk and took keyboard focus.
 - Not covered by e2e: native fullscreen, Hide, dialogs, Monitor disconnect, hung apps, hotkeys, borders by eye,
   multi-Monitor moves.
 

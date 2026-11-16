@@ -5,7 +5,9 @@ import TatamiCore
 enum Placement: Equatable { case frame(Rect), parked, free }
 
 enum WindowEvent {
-    case opened(WindowID, AppWorker, at: Rect, floating: Bool, initial: Bool)
+    case opened(WindowID, AppWorker, at: Rect, title: String, floating: Bool, initial: Bool)
+    /// The Window's title changed (titles identify Windows across a reboot).
+    case title(WindowID, String)
     case closed(WindowID)
     case focused(WindowID)
     /// A Tiled Window is not where tatami put it (mouse drag, or the app moved itself).
@@ -164,8 +166,9 @@ final class AppWorker {
     func focus(_ id: WindowID, raise: Bool, previous: (pid: pid_t, window: WindowID)?) {
         queue.async { [self] in
             guard let w = windows[id] else { return }
-            if raise { AXUIElementPerformAction(w, kAXRaiseAction as CFString) }
             focusWindow(pid: app.processIdentifier, window: id, previous: previous, raise: raise)
+            // Raise once the app is frontmost: before that, it only reorders the window within its own app.
+            if raise { AXUIElementPerformAction(w, kAXRaiseAction as CFString) }
         }
     }
 
@@ -232,6 +235,8 @@ final class AppWorker {
                 windows.keys.forEach(forget)
             case kAXWindowMovedNotification, kAXWindowResizedNotification:
                 if let id = id(of: el) { moved(id) }
+            case kAXTitleChangedNotification:
+                if let id = id(of: el) { send(.title(id, attribute(el, kAXTitleAttribute) as? String ?? "")) }
             default:
                 reportFocus()
             }
@@ -273,7 +278,7 @@ final class AppWorker {
                   [kAXStandardWindowSubrole, kAXDialogSubrole, kAXSystemDialogSubrole, kAXFloatingWindowSubrole].contains(subrole)
             else { continue }
             for n in [kAXUIElementDestroyedNotification, kAXWindowMiniaturizedNotification, kAXWindowDeminiaturizedNotification,
-                      kAXWindowMovedNotification, kAXWindowResizedNotification] {
+                      kAXWindowMovedNotification, kAXWindowResizedNotification, kAXTitleChangedNotification] {
                 AXObserverAddNotification(observer, w, n as CFString, me)
             }
             // Minimized Windows are ignored until restored.
@@ -283,10 +288,11 @@ final class AppWorker {
                 // Left parked by a tatami that crashed: its original position is gone. (macOS clamps y, so x decides.)
                 placed[id] = .parked
             }
-            // Dialogs, panels and windows that cannot be resized float.
+            // Dialogs, panels, windows that cannot be resized, and anything a menu bar app shows, float.
             var resizable: DarwinBoolean = false
             AXUIElementIsAttributeSettable(w, kAXSizeAttribute as CFString, &resizable)
-            send(.opened(id, self, at: r, floating: subrole != kAXStandardWindowSubrole || !resizable.boolValue, initial: !scanned))
+            send(.opened(id, self, at: r, title: attribute(w, kAXTitleAttribute) as? String ?? "", floating: subrole != kAXStandardWindowSubrole || !resizable.boolValue || app.activationPolicy != .regular,
+                        initial: !scanned))
             if attribute(w, "AXFullScreen") as? Bool == true {
                 native.insert(id)
                 send(.nativeFullscreen(id, true))

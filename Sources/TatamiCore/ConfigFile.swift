@@ -48,7 +48,7 @@ public struct ConfigFile: Equatable, Sendable {
         var lines = ["gap.inner = 8", "gap.outer = 8", "border.width = 4", "border.active = #ff2d78",
                      "border.inactive = #414550", "focus.follows_mouse = true", "",
                      "bind alt+tab = desk last", "bind alt+f = fullscreen toggle", "bind alt+t = float toggle",
-                     "bind alt+e = split toggle", "bind alt+a = layout toggle"]
+                     "bind alt+e = split toggle", "bind alt+comma = layout toggle"]
         for (key, dir) in [("h", "left"), ("j", "down"), ("k", "up"), ("l", "right")] {
             lines += ["bind alt+\(key) = focus \(dir)", "bind alt+shift+\(key) = move \(dir)"]
         }

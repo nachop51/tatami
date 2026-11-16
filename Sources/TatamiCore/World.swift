@@ -14,7 +14,7 @@ public struct Config: Equatable, Sendable {
     }
 }
 
-public enum LayoutKind: String, Sendable { case dwindle, accordion }
+public enum LayoutKind: String, Sendable, Codable { case dwindle, accordion }
 
 struct Desk {
     var monitor: MonitorID  // where it shows now
@@ -26,6 +26,8 @@ struct Desk {
     var fullscreen: WindowID?
 
     var isEmpty: Bool { history.isEmpty }
+    /// The tree of the Windows that are really there (no placeholders): what gets laid out.
+    var live: Node? { tree?.keeping { $0 & ghostBit == 0 } }
     var frontTiled: WindowID? { tree.flatMap { t in history.first(where: t.contains) } }
 }
 
@@ -58,11 +60,28 @@ public struct World {
     var mins: [WindowID: Node.Size] = [:]  // minimum sizes learnt from refused resizes
     var floatFrames: [WindowID: Rect] = [:]  // where Floating Windows are, as the shell reports it
     var native: Set<WindowID> = []  // in macOS native fullscreen: unmanaged, tile kept
+    var ghostFloats: [WindowID: Int] = [:]  // placeholders for Floating Windows of a restored arrangement -> Desk
+    var ghostFront: [Int: WindowID] = [:]  // the placeholder that was each Desk's focused Window
 
-    public init(monitors: [Monitor], config: Config = Config(), pins: [Int: Int] = [:], layouts: [Int: LayoutKind] = [:]) {
+    /// `restoring` brings back a saved arrangement: its Desks return with a placeholder for every Window,
+    /// which `adopt` fills in as the Windows show up.
+    public init(monitors: [Monitor], config: Config = Config(), pins: [Int: Int] = [:], layouts: [Int: LayoutKind] = [:],
+                restoring saved: Snapshot? = nil) {
         self.config = config
         self.pins = pins
         self.layouts = layouts
+        if let saved {
+            for (n, d) in saved.desks where Command.deskNumbers.contains(n) {
+                var desk = Desk(monitor: d.monitor, home: d.home, layout: d.layout)
+                desk.tree = d.tree?.mapping { $0 | ghostBit }
+                desks[n] = desk
+                for f in d.floating { ghostFloats[f | ghostBit] = n }
+                if let front = d.front { ghostFront[n] = front | ghostBit }
+            }
+            active = saved.active
+            focusedMonitor = saved.focusedMonitor
+            lastDesk = saved.lastDesk
+        }
         setMonitors(monitors)
     }
 
@@ -76,6 +95,71 @@ public struct World {
     public func windows(onDesk n: Int) -> [WindowID] { desks[n]?.history ?? [] }
     public func layoutKind(ofDesk n: Int) -> LayoutKind? { desks[n]?.layout }
 
+    // MARK: Saving and restoring
+
+    /// Everything needed to arrange the same Windows the same way again.
+    public struct Snapshot: Codable, Equatable {
+        struct DeskState: Codable, Equatable {
+            var layout: LayoutKind
+            var home: MonitorID
+            var monitor: MonitorID
+            var tree: Node?
+            var floating: [WindowID]
+            var front: WindowID?
+        }
+        var desks: [Int: DeskState]
+        var active: [MonitorID: Int]
+        var focusedMonitor: MonitorID
+        var lastDesk: Int?
+    }
+
+    public var snapshot: Snapshot {
+        Snapshot(desks: desks.mapValues {
+                     .init(layout: $0.layout, home: $0.home, monitor: $0.monitor, tree: $0.live, floating: $0.floating, front: $0.history.first)
+                 },
+                 active: active, focusedMonitor: focusedMonitor, lastDesk: lastDesk)
+    }
+
+    /// True while Windows of the restored arrangement are still awaited.
+    public var hasPlaceholders: Bool { !ghostFloats.isEmpty || desks.values.contains { $0.tree != $0.live } }
+
+    /// A Window of the restored arrangement showed up as `w` (its id may differ from the `saved` one):
+    /// it takes its old place. False if no place was waiting for it.
+    @discardableResult public mutating func adopt(_ saved: WindowID, as w: WindowID, floating: Bool = false) -> Bool {
+        let g = saved | ghostBit
+        guard desk(of: w) == nil else { return false }
+        let n: Int
+        if let floatDesk = ghostFloats.removeValue(forKey: g), desks[floatDesk] != nil {
+            n = floatDesk
+            desks[n]!.floating.append(w)
+        } else if let tiledDesk = desks.first(where: { $0.value.tree?.contains(g) == true })?.key {
+            n = tiledDesk
+            if floating {
+                desks[n]!.tree = desks[n]!.tree!.removing(g)
+                desks[n]!.floating.append(w)
+            } else {
+                desks[n]!.tree = desks[n]!.tree!.swapping(g, w)
+            }
+        } else {
+            return false
+        }
+        if ghostFront[n] == g {
+            ghostFront[n] = nil
+            desks[n]!.history.insert(w, at: 0)
+        } else {
+            desks[n]!.history.append(w)
+        }
+        return true
+    }
+
+    /// Stop waiting: Windows that did not come back lose their place.
+    public mutating func dropPlaceholders() {
+        for n in desks.keys { desks[n]!.tree = desks[n]!.live }
+        ghostFloats = [:]
+        ghostFront = [:]
+        collect()
+    }
+
     /// One line per Desk, for `tatami state`.
     public var summary: String {
         deskNumbers.map { n in
@@ -83,7 +167,7 @@ public struct World {
             let m = monitors.firstIndex { $0.id == d.monitor }.map { $0 + 1 } ?? 0
             let flags = (active[d.monitor] == n ? "active " : "") + (n == focusedDesk ? "focused " : "")
             let mins = d.history.compactMap { w in mins[w].map { "\(w)≥\(Int($0.w))x\(Int($0.h))" } }
-            return "desk \(n) monitor \(m) \(flags)\(d.layout) tiled \(d.tree?.leaves ?? []) floating \(d.floating)"
+            return "desk \(n) monitor \(m) \(flags)\(d.layout) tiled \(d.live?.leaves ?? []) floating \(d.floating)"
                 + (mins.isEmpty ? "" : " min \(mins.joined(separator: " "))")
         }.joined(separator: "\n")
     }
@@ -95,7 +179,7 @@ public struct World {
             guard active[d.monitor] == n else { out.hidden.formUnion(d.history); continue }
             let m = frame(d.monitor)
             out.floating.formUnion(d.floating)
-            if let tree = d.tree {
+            if let tree = d.live {
                 switch d.layout {
                 case .dwindle:
                     for (w, r) in tiles(d) { out.frames[w] = r.inset(config.gapInner / 2) }
@@ -149,7 +233,7 @@ public struct World {
 
     /// The Window refused a smaller size. Its tile grows; if the Desk cannot fit it at all, it floats.
     public mutating func setMinimumSize(_ w: WindowID, width: Double, height: Double) {
-        guard let n = desk(of: w), let tree = desks[n]!.tree, tree.contains(w) else { return }
+        guard let n = desk(of: w), let tree = desks[n]!.live, tree.contains(w) else { return }
         mins[w] = (max(mins[w]?.w ?? 0, width), max(mins[w]?.h ?? 0, height))
         let need = tree.minSize(minimum), area = tileArea(desks[n]!)
         if need.w > area.w + 0.5 || need.h > area.h + 0.5 {
@@ -172,7 +256,7 @@ public struct World {
     /// The mouse resized a Tiled Window from `before` to `after`: the splits follow the edges that moved.
     /// Measured against where the Window was, not its tile: an app may sit smaller or bigger than its tile.
     public mutating func resized(_ w: WindowID, from before: Rect, to after: Rect) {
-        guard let n = desk(of: w), let d = desks[n], d.layout == .dwindle, let tree = d.tree, let old = tiles(d)[w] else { return }
+        guard let n = desk(of: w), let d = desks[n], d.layout == .dwindle, let tree = d.live, let old = tiles(d)[w] else { return }
         let new = Rect(old.x + after.x - before.x, old.y + after.y - before.y,
                        old.w + after.w - before.w, old.h + after.h - before.h)
         desks[n]!.tree = tree.resizing(w, from: old, to: new, in: tileArea(d), min: minimum)
@@ -289,7 +373,7 @@ public struct World {
     private func tileArea(_ d: Desk) -> Rect { frame(d.monitor).inset(config.gapOuter - config.gapInner / 2) }
 
     /// Dwindle tiles of a Desk before the inner gap is cut out of each: they touch, which is what navigation wants.
-    private func tiles(_ d: Desk) -> [WindowID: Rect] { d.tree?.frames(in: tileArea(d), min: minimum) ?? [:] }
+    private func tiles(_ d: Desk) -> [WindowID: Rect] { d.live?.frames(in: tileArea(d), min: minimum) ?? [:] }
 
     private func has(_ m: MonitorID) -> Bool { monitors.contains { $0.id == m } }
     private func frame(_ m: MonitorID) -> Rect { monitors.first { $0.id == m }!.frame }
@@ -327,7 +411,9 @@ public struct World {
 
     /// An empty Desk disappears when left.
     private mutating func collect() {
-        desks = desks.filter { !$0.value.isEmpty || active[$0.value.monitor] == $0.key }
+        desks = desks.filter { n, d in
+            !d.isEmpty || active[d.monitor] == n || d.tree != nil || ghostFloats.values.contains(n)  // placeholders pending
+        }
     }
 
     /// Make Desk `n` the Active Desk of its Monitor and focus that Monitor.
@@ -356,6 +442,9 @@ public struct World {
         } else if let tree = d.tree, let target = d.frontTiled {
             let r = tiles(d)[target]!
             d.tree = tree.inserting(w, at: target, r.w >= r.h ? .sideBySide : .stacked)
+        } else if let tree = d.tree {
+            // Only placeholders so far: keep them, they may still be claimed.
+            d.tree = tree.inserting(w, at: tree.leaves[0], .sideBySide)
         } else {
             d.tree = .leaf(w)
         }
@@ -384,11 +473,11 @@ public struct World {
     private func neighbour(of w: WindowID, _ dir: Direction, on n: Int) -> WindowID? {
         let d = desks[n]!
         var frames = d.layout == .dwindle ? tiles(d) : [:]
-        if d.layout == .accordion, let tree = d.tree { for leaf in tree.leaves { frames[leaf] = frame(d.monitor) } }
+        if d.layout == .accordion, let tree = d.live { for leaf in tree.leaves { frames[leaf] = frame(d.monitor) } }
         for f in d.floating { frames[f] = floatFrames[f] }
 
         var tiled: WindowID?
-        if let tree = d.tree, tree.contains(w) {
+        if let tree = d.live, tree.contains(w) {
             switch d.layout {
             case .accordion:
                 let leaves = tree.leaves, i = leaves.firstIndex(of: w)!
